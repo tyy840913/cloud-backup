@@ -1,1156 +1,2033 @@
-// Worker 代码 
-// 辅助函数：解码并编码 Basic Auth 
-function getAuthHeader(username, password) { 
-    const credentials = `${username}:${password}`; 
-    const encoded = btoa(credentials); 
-    return `Basic ${encoded}`; 
-} 
+// Worker 代码
 
-function decodeBasicAuth(authHeader) { 
-    if (!authHeader || !authHeader.startsWith('Basic ')) return null; 
-    try { 
-        const encoded = authHeader.substring(6); 
-        const decoded = atob(encoded); 
-        const [username, password] = decoded.split(':'); 
-        return { username, password }; 
-    } catch (e) { 
-        return null; 
-    } 
-} 
+// 辅助函数：解码并编码 Basic Auth
+function getAuthHeader(username, password) {
+  const credentials = `${username}:${password}`;
+  const encoded = btoa(credentials);
+  return `Basic ${encoded}`;
+}
 
-function guessContentType(filename) { 
-    const fileExtension = filename.split('.').pop().toLowerCase(); 
-    const mimeTypes = { 
-        'sh': 'application/x-sh', 
-        'js': 'application/javascript', 
-        'txt': 'text/plain', 
-        'html': 'text/html', 
-        'css': 'text/css', 
-        'json': 'application/json', 
-        'jpg': 'image/jpeg', 
-        'jpeg': 'image/jpeg', 
-        'png': 'image/png', 
-        'gif': 'image/gif', 
-        'svg': 'image/svg+xml', 
-        'webp': 'image/webp', 
-        'pdf': 'application/pdf', 
-        'zip': 'application/zip', 
-        'tar': 'application/x-tar', 
-        'gz': 'application/gzip', 
-        'mp3': 'audio/mpeg', 
-        'mp4': 'video/mp4' 
-    }; 
-    return mimeTypes[fileExtension] || 'application/octet-stream'; 
-} 
+function decodeBasicAuth(authHeader) {
+  if (!authHeader || !authHeader.startsWith('Basic ')) return null;
+  try {
+    const encoded = authHeader.substring(6);
+    const decoded = atob(encoded);
+    const [username, password] = decoded.split(':');
+    return { username, password };
+  } catch (e) {
+    return null;
+  }
+}
 
-function generateToken() { 
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'; 
-    let result = ''; 
-    for (let i = 0; i < 24; i++) result += chars.charAt(Math.floor(Math.random() * chars.length)); 
-    return result; 
-} 
+function guessContentType(filename) {
+  const fileExtension = filename.split('.').pop().toLowerCase();
+  const mimeTypes = {
+    'sh': 'application/x-sh', 'js': 'application/javascript', 'txt': 'text/plain',
+    'html': 'text/html', 'css': 'text/css', 'json': 'application/json',
+    'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'gif': 'image/gif',
+    'svg': 'image/svg+xml', 'webp': 'image/webp', 'pdf': 'application/pdf',
+    'zip': 'application/zip', 'tar': 'application/x-tar', 'gz': 'application/gzip',
+    'mp3': 'audio/mpeg', 'mp4': 'video/mp4'
+  };
+  return mimeTypes[fileExtension] || 'application/octet-stream';
+}
 
-async function checkToken(request, env, kv) { 
-    const url = new URL(request.url); 
-    const token = url.searchParams.get('token') || request.headers.get('X-Token'); 
-    if (!token) return null; 
-    if (env.TOKEN) { 
-        const tokens = env.TOKEN.split(',').map(t => t.trim()).filter(Boolean); 
-        if (tokens.includes(token)) return { permissions: { download: true, upload: true, delete: true }, fromEnv: true }; 
-    } 
-    if (kv) { 
-        try { 
-            const val = await kv.get('__tokens__/list'); 
-            if (val) { 
-                const list = JSON.parse(val); 
-                const found = list.find(t => t.token === token); 
-                if (found) return found; 
-            } 
-        } catch (e) {} 
-    } 
-    return null; 
-} 
+function generateToken() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < 24; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+  return result;
+}
 
-function isSafePath(filename) { 
-    if (!filename) return false; 
-    if (filename.includes('..')) return false; 
-    if (filename.startsWith('/')) return false; 
-    return true; 
-} 
+async function checkToken(request, env, kv) {
+  const url = new URL(request.url);
+  const token = url.searchParams.get('token') || request.headers.get('X-Token');
+  if (!token) return null;
+  if (kv) {
+    try {
+      const val = await kv.get('__tokens__/list');
+      if (val) {
+        const list = JSON.parse(val);
+        const found = list.find(t => t.token === token);
+        if (found) return found;
+      }
+    } catch (e) {}
+  }
+  return null;
+}
 
-function isFileOperation(path, method) { 
-    const internalAPIs = ['list-keys', 'list-keys-flat', 'list-meta', 'node-stats', 'sync-all']; 
-    if (method === 'GET' && (path === 'stats' || path === 'list-all')) return true; 
-    if ((method === 'PUT' && path.startsWith('update/')) || (method === 'POST' && path.startsWith('rename/')) || (method === 'DELETE' && path.startsWith('delete/'))) return true; 
-    if (method === 'GET' && !internalAPIs.includes(path) && path !== '' && !path.startsWith('proxy/') && !path.startsWith('__info__')) return true; 
-    if (path.startsWith('proxy/')) { 
-        const parts = path.split('/'); 
-        const targetPath = parts.slice(2).join('/'); 
-        if ((method === 'PUT' && targetPath.startsWith('update/')) || (method === 'POST' && targetPath.startsWith('rename/')) || (method === 'DELETE' && targetPath.startsWith('delete/'))) return true; 
-        if (method === 'GET' && !internalAPIs.includes(targetPath) && targetPath !== '') return true; 
-    } 
-    return false; 
-} 
+function isSafePath(filename) {
+  if (!filename) return false;
+  if (filename.includes('..')) return false;
+  if (filename.startsWith('/')) return false;
+  return true;
+}
 
-function hashString(str) { 
-    let hash = 0; 
-    for (let i = 0; i < str.length; i++) { 
-        hash = ((hash << 5) - hash) + str.charCodeAt(i); 
-        hash |= 0; 
-    } 
-    return Math.abs(hash); 
-} 
+function isFileOperation(path, method) {
+  const internalAPIs = ['list-keys', 'list-keys-flat', 'list-meta', 'node-stats', 'sync-all', 'page-data'];
+  if (method === 'GET' && (path === 'stats' || path === 'list-all')) return true;
+  if ((method === 'PUT' && path.startsWith('update/')) ||
+      (method === 'POST' && path.startsWith('rename/')) ||
+      (method === 'DELETE' && path.startsWith('delete/'))) return true;
+  if (method === 'GET' && !internalAPIs.includes(path) && path !== '' && !path.startsWith('proxy/') && !path.startsWith('__info__')) return true;
+  if (path.startsWith('proxy/')) {
+    const parts = path.split('/');
+    const targetPath = parts.slice(2).join('/');
+    if ((method === 'PUT' && targetPath.startsWith('update/')) ||
+        (method === 'POST' && targetPath.startsWith('rename/')) ||
+        (method === 'DELETE' && targetPath.startsWith('delete/'))) return true;
+    if (method === 'GET' && !internalAPIs.includes(targetPath) && targetPath !== '') return true;
+  }
+  return false;
+}
 
-async function getAllDomains(env, currentDomain, kv) { 
-    let all = [currentDomain]; 
-    if (kv) { 
-        try { 
-            const val = await kv.get('__settings__/domains'); 
-            if (val) all = [...new Set([currentDomain, ...JSON.parse(val)])]; 
-        } catch (e) {} 
-    } 
-    if (all.length === 1 && env.OTHER_DOMAINS) { 
-        const envDoms = env.OTHER_DOMAINS.split(',').map(d => d.trim()).filter(Boolean); 
-        if (envDoms.length) { 
-            all = [...all, ...envDoms]; 
-            try { 
-                await kv.put('__settings__/domains', JSON.stringify(all.filter(d => d !== currentDomain))); 
-            } catch (e) {} 
-        } 
-    } 
-    return all; 
-} 
+function hashString(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
 
-async function loadKVCredentials(kv) { 
-    try { 
-        const val = await kv.get('__settings__/credentials'); 
-        if (val) return JSON.parse(val); 
-    } catch (e) {} 
-    return null; 
-} 
+async function getAllDomains(env, currentDomain, kv) {
+  let all = [currentDomain];
+  if (kv) {
+    try {
+      const val = await kv.get('__settings__/domains');
+      if (val) all = [...new Set([currentDomain, ...JSON.parse(val)])];
+    } catch (e) {}
+  }
+  return all;
+}
 
-async function checkCredentials(authHeader, env, kv, loadedCreds = null) { 
-    const creds = decodeBasicAuth(authHeader); 
-    if (!creds) return false; 
-    const kvCreds = loadedCreds || await loadKVCredentials(kv); 
-    if (kvCreds) return kvCreds.username === creds.username && kvCreds.password === creds.password; 
-    if (env.JIANGUO_USERNAME && env.JIANGUO_PASSWORD) { 
-        const match = env.JIANGUO_USERNAME === creds.username && env.JIANGUO_PASSWORD === creds.password; 
-        if (match) { 
-            try { 
-                await kv.put('__settings__/credentials', JSON.stringify({ username: creds.username, password: creds.password })); 
-            } catch (e) {} 
-        } 
-        return match; 
-    } 
-    return false; 
-} 
+async function loadKVCredentials(kv) {
+  try {
+    const val = await kv.get('__settings__/credentials');
+    if (val) return JSON.parse(val);
+  } catch (e) {}
+  return null;
+}
 
-async function syncSettingsToAll(key, data, allDomains, currentDomain, authHeader) { 
-    const body = JSON.stringify(data); 
-    await Promise.allSettled( 
-        allDomains.filter(d => d !== currentDomain).map(d => fetch(`https://${d}/__settings__/${key}`, { 
-            method: 'PUT', 
-            body, 
-            headers: { 'Authorization': authHeader, 'Content-Type': 'application/json' } 
-        }).catch(() => {})) 
-    ); 
-} 
+async function checkCredentials(authHeader, env, kv) {
+  const creds = decodeBasicAuth(authHeader);
+  if (!creds) return false;
+  const kvCreds = await loadKVCredentials(kv);
+  if (kvCreds) return kvCreds.username === creds.username && kvCreds.password === creds.password;
+  if (env.JIANGUO_USERNAME && env.JIANGUO_PASSWORD) {
+    const match = env.JIANGUO_USERNAME === creds.username && env.JIANGUO_PASSWORD === creds.password;
+    if (match) {
+      try { await kv.put('__settings__/credentials', JSON.stringify({ username: creds.username, password: creds.password })); } catch (e) {}
+    }
+    return match;
+  }
+  return false;
+}
 
-// 跨域代理请求 
-function buildProxyUrl(targetDomain, targetPath, url) { 
-    let search = url.search; 
-    if (!search.includes('node=')) { 
-        search = (search ? search + '&' : '?') + 'node=' + encodeURIComponent(targetDomain); 
-    } 
-    return `https://${targetDomain}/${targetPath}${search}`; 
-} 
+async function syncSettingsToAll(key, data, allDomains, currentDomain, authHeader) {
+  const body = JSON.stringify(data);
+  await Promise.allSettled(
+    allDomains.filter(d => d !== currentDomain).map(d =>
+      fetch(`https://${d}/__settings__/${key}`, {
+        method: 'PUT', body,
+        headers: { 'Authorization': authHeader, 'Content-Type': 'application/json' }
+      }).catch(() => {})
+    )
+  );
+}
 
-async function proxyGet(targetDomain, targetPath, requestAuthHeader, url) { 
-    const targetUrl = buildProxyUrl(targetDomain, targetPath, url); 
-    try { 
-        const resp = await fetch(targetUrl, { headers: { 'Authorization': requestAuthHeader } }); 
-        return new Response(resp.body, resp); 
-    } catch (e) { 
-        return new Response(`代理请求失败: ${e.message}\n`, { status: 500 }); 
-    } 
-} 
+// 跨域代理请求
+function buildProxyUrl(targetDomain, targetPath, url) {
+  let search = url.search;
+  if (!search.includes('node=')) {
+    search = (search ? search + '&' : '?') + 'node=' + encodeURIComponent(targetDomain);
+  }
+  return `https://${targetDomain}/${targetPath}${search}`;
+}
 
-async function proxyPut(targetDomain, targetPath, request, requestAuthHeader, url) { 
-    const targetUrl = buildProxyUrl(targetDomain, targetPath, url); 
-    try { 
-        const resp = await fetch(targetUrl, { 
-            method: 'PUT', 
-            body: request.body, // 透传 stream 
-            headers: { 
-                'Authorization': requestAuthHeader, 
-                'Content-Type': request.headers.get('Content-Type') || 'application/octet-stream' 
-            } 
-        }); 
-        return new Response(resp.body, resp); 
-    } catch (e) { 
-        return new Response(`代理请求失败: ${e.message}\n`, { status: 500 }); 
-    } 
-} 
+async function proxyGet(targetDomain, targetPath, requestAuthHeader, url) {
+  const targetUrl = buildProxyUrl(targetDomain, targetPath, url);
+  try {
+    const resp = await fetch(targetUrl, { headers: { 'Authorization': requestAuthHeader } });
+    return new Response(resp.body, resp);
+  } catch (e) {
+    return new Response(`代理请求失败: ${e.message}\n`, { status: 500 });
+  }
+}
 
-async function proxyRequest(targetDomain, targetPath, request, requestAuthHeader, url) { 
-    if (request.method === 'GET' || request.method === 'HEAD') { 
-        return proxyGet(targetDomain, targetPath, requestAuthHeader, url); 
-    } 
-    const targetUrl = buildProxyUrl(targetDomain, targetPath, url); 
-    try { 
-        const fetchInit = { 
-            method: request.method, 
-            headers: { 
-                'Authorization': requestAuthHeader, 
-                'Content-Type': request.headers.get('Content-Type') || 'application/octet-stream' 
-            } 
-        }; 
-        if (request.method !== 'GET' && request.method !== 'HEAD') { 
-            fetchInit.body = request.body; // 透传 stream 
-        } 
-        const resp = await fetch(targetUrl, fetchInit); 
-        return new Response(resp.body, resp); 
-    } catch (e) { 
-        return new Response(`代理请求失败: ${e.message}\n`, { status: 500 }); 
-    } 
-} 
+async function proxyPut(targetDomain, targetPath, request, requestAuthHeader, url, bodyText) {
+  const targetUrl = buildProxyUrl(targetDomain, targetPath, url);
+  try {
+    const body = bodyText !== undefined ? bodyText : await request.text();
+    const resp = await fetch(targetUrl, {
+      method: 'PUT', body,
+      headers: { 'Authorization': requestAuthHeader, 'Content-Type': request.headers.get('Content-Type') || 'application/octet-stream' }
+    });
+    return new Response(resp.body, resp);
+  } catch (e) {
+    return new Response(`代理请求失败: ${e.message}\n`, { status: 500 });
+  }
+}
 
-function resolveNode(filename, allDomains, nodeParam) { 
-    if (nodeParam) { 
-        if (allDomains.includes(nodeParam)) return nodeParam; 
-        const idx = parseInt(nodeParam); 
-        if (!isNaN(idx) && idx >= 0 && idx < allDomains.length) return allDomains[idx]; 
-    } 
-    return allDomains[hashString(filename) % allDomains.length]; 
-} 
+async function proxyRequest(targetDomain, targetPath, request, requestAuthHeader, url, bodyText) {
+  if (request.method === 'GET' || request.method === 'HEAD') {
+    return proxyGet(targetDomain, targetPath, requestAuthHeader, url);
+  }
+  const targetUrl = buildProxyUrl(targetDomain, targetPath, url);
+  try {
+    const body = bodyText !== undefined ? bodyText : await request.text();
+    const fetchInit = {
+      method: request.method,
+      headers: { 'Authorization': requestAuthHeader, 'Content-Type': request.headers.get('Content-Type') || 'application/octet-stream' }
+    };
+    if (body) fetchInit.body = body;
+    const resp = await fetch(targetUrl, fetchInit);
+    return new Response(resp.body, resp);
+  } catch (e) {
+    return new Response(`代理请求失败: ${e.message}\n`, { status: 500 });
+  }
+}
 
-// --- 信息文件管理（每个域名一个，记录该域名下的所有文件）--- 
-function getInfoKey(domain) { 
-    return `__info__/${domain}`; 
-} 
+function resolveNode(filename, allDomains, nodeParam) {
+  if (nodeParam) {
+    if (allDomains.includes(nodeParam)) return nodeParam;
+    const idx = parseInt(nodeParam);
+    if (!isNaN(idx) && idx >= 0 && idx < allDomains.length) return allDomains[idx];
+  }
+  return allDomains[hashString(filename) % allDomains.length];
+}
 
-async function loadInfo(MY_SCRIPT_BUCKET, domain) { 
-    const val = await MY_SCRIPT_BUCKET.get(getInfoKey(domain)); 
-    if (val) { 
-        try { 
-            return JSON.parse(val); 
-        } catch (e) {} 
-    } 
-    return { updated_at: '1970-01-01T00:00:00Z', files: {} }; 
-} 
+// --- 信息文件管理（每个域名一个，记录该域名下的所有文件）---
+function getInfoKey(domain) {
+  return `__info__/${domain}`;
+}
 
-async function saveInfo(MY_SCRIPT_BUCKET, domain, info) { 
-    info.updated_at = new Date().toISOString(); 
-    await MY_SCRIPT_BUCKET.put(getInfoKey(domain), JSON.stringify(info)); 
-} 
+async function loadInfo(MY_SCRIPT_BUCKET, domain) {
+  const val = await MY_SCRIPT_BUCKET.get(getInfoKey(domain));
+  if (val) {
+    try { return JSON.parse(val); } catch (e) {}
+  }
+  return { updated_at: '1970-01-01T00:00:00Z', files: {} };
+}
 
-async function addFileToInfo(MY_SCRIPT_BUCKET, domain, filename, size, contentType) { 
-    const info = await loadInfo(MY_SCRIPT_BUCKET, domain); 
-    info.files[filename] = { size, content_type: contentType }; 
-    await saveInfo(MY_SCRIPT_BUCKET, domain, info); 
-    return info; 
-} 
+async function saveInfo(MY_SCRIPT_BUCKET, domain, info) {
+  info.updated_at = new Date().toISOString();
+  await MY_SCRIPT_BUCKET.put(getInfoKey(domain), JSON.stringify(info));
+}
 
-async function removeFileFromInfo(MY_SCRIPT_BUCKET, domain, filename) { 
-    const info = await loadInfo(MY_SCRIPT_BUCKET, domain); 
-    delete info.files[filename]; 
-    await saveInfo(MY_SCRIPT_BUCKET, domain, info); 
-    return info; 
-} 
+async function addFileToInfo(MY_SCRIPT_BUCKET, domain, filename, size, contentType) {
+  const info = await loadInfo(MY_SCRIPT_BUCKET, domain);
+  info.files[filename] = { size, content_type: contentType };
+  await saveInfo(MY_SCRIPT_BUCKET, domain, info);
+  return info;
+}
 
-// 获取所有域名信息文件的合并列表 
-async function getAllFilesFromInfo(MY_SCRIPT_BUCKET, allDomains) { 
-    const files = []; 
-    for (const domain of allDomains) { 
-        const info = await loadInfo(MY_SCRIPT_BUCKET, domain); 
-        for (const [filename, f] of Object.entries(info.files)) { 
-            files.push({ filename, size: f.size, content_type: f.content_type, node: domain }); 
-        } 
-    } 
-    return files; 
-} 
+async function removeFileFromInfo(MY_SCRIPT_BUCKET, domain, filename) {
+  const info = await loadInfo(MY_SCRIPT_BUCKET, domain);
+  delete info.files[filename];
+  await saveInfo(MY_SCRIPT_BUCKET, domain, info);
+  return info;
+}
 
-// 从信息文件找文件所在节点 
-async function findFileNodeFromInfo(MY_SCRIPT_BUCKET, filename, allDomains, defaultDomain) { 
-    for (const domain of allDomains) { 
-        try { 
-            const info = await loadInfo(MY_SCRIPT_BUCKET, domain); 
-            if (info.files && info.files[filename]) return domain; 
-        } catch (e) { /* 忽略读取失败 */ } 
-    } 
-    return defaultDomain; 
-} 
+// 获取所有域名信息文件的合并列表（并行读取）
+async function getAllFilesFromInfo(MY_SCRIPT_BUCKET, allDomains) {
+  const infos = await Promise.all(allDomains.map(d => loadInfo(MY_SCRIPT_BUCKET, d)));
+  const files = [];
+  for (let i = 0; i < allDomains.length; i++) {
+    for (const [filename, f] of Object.entries(infos[i].files)) {
+      files.push({ filename, size: f.size, content_type: f.content_type, node: allDomains[i] });
+    }
+  }
+  return files;
+}
 
-// 从信息文件计算节点大小（负载均衡用） 
-async function computeNodeSizes(MY_SCRIPT_BUCKET, allDomains) { 
-    const nodeSizes = {}; 
-    for (const domain of allDomains) { 
-        nodeSizes[domain] = 0; 
-    } 
-    for (const domain of allDomains) { 
-        const info = await loadInfo(MY_SCRIPT_BUCKET, domain); 
-        for (const f of Object.values(info.files)) { 
-            nodeSizes[domain] += f.size || 0; 
-        } 
-    } 
-    return nodeSizes; 
-} 
+// 从信息文件找文件所在节点
+async function findFileNodeFromInfo(MY_SCRIPT_BUCKET, filename, allDomains, defaultDomain) {
+  for (const domain of allDomains) {
+    try {
+      const info = await loadInfo(MY_SCRIPT_BUCKET, domain);
+      if (info.files && info.files[filename]) return domain;
+    } catch (e) { /* 忽略读取失败 */ }
+  }
+  return defaultDomain;
+}
 
-async function findLightestNode(MY_SCRIPT_BUCKET, allDomains) { 
-    const nodeSizes = await computeNodeSizes(MY_SCRIPT_BUCKET, allDomains); 
-    let minNode = allDomains[0]; 
-    let minSize = nodeSizes[minNode] || 0; 
-    for (const domain of allDomains) { 
-        const size = nodeSizes[domain] || 0; 
-        if (size < minSize) { 
-            minSize = size; 
-            minNode = domain; 
-        } 
-    } 
-    return minNode; 
-} 
+// 从信息文件计算节点大小（负载均衡用）
+async function computeNodeSizes(MY_SCRIPT_BUCKET, allDomains) {
+  const nodeSizes = {};
+  for (const domain of allDomains) {
+    nodeSizes[domain] = 0;
+  }
+  for (const domain of allDomains) {
+    const info = await loadInfo(MY_SCRIPT_BUCKET, domain);
+    for (const f of Object.values(info.files)) {
+      nodeSizes[domain] += f.size || 0;
+    }
+  }
+  return nodeSizes;
+}
 
-// --- 文件管理器 HTML 页面（使用模板字符串，这个可以嵌套）---
-const fileManagerHtml = ` 
-<!DOCTYPE html> 
-<html lang="zh-CN"> 
-<head> 
-<meta charset="UTF-8"> 
-<meta name="viewport" content="width=device-width, initial-scale=1.0"> 
-<title>KV 跨域文件管理器</title> 
-<style> 
-:root { --primary-color: #007bff; --border-color: #dee2e6; --hover-bg-color: #e9ecef; --text-color: #212529; --folder-color: #f7b731; --file-color: #adb5bd; --danger-color: #dc3545; --success-color: #28a745; } 
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; background-color: #f8f9fa; } 
-.container { max-width: 960px; margin: 0 auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); } 
-header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 10px; border-bottom: 1px solid var(--border-color); margin-bottom: 20px; } 
-h1 { font-size: 1.75rem; margin: 0; } 
-#file-input { display: none; } 
-.upload-btn { background-color: var(--primary-color); color: white; padding: 8px 12px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; } 
-.upload-btn:hover { background-color: #0056b3; } 
-.upload-btn:disabled { background-color: #a0a0a0; cursor: not-allowed; } 
-#path-breadcrumbs { font-size: 1rem; margin-bottom: 20px; color: #6c757d; white-space: nowrap; overflow-x: auto; } 
-#file-list { list-style: none; padding: 0; border: 1px solid var(--border-color); border-radius: 5px; } 
-#file-list li { display: flex; align-items: center; padding: 12px 15px; border-bottom: 1px solid var(--border-color); transition: background-color 0.2s; } 
-#file-list li:last-child { border-bottom: none; } 
-#file-list li:hover { background-color: var(--hover-bg-color); } 
-.item-icon { width: 24px; height: 24px; margin-right: 15px; flex-shrink: 0; } 
-.item-name { flex: 1; cursor: pointer; color: var(--text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } 
-.item-name.folder { font-weight: 500; } 
-.item-actions { display: flex; align-items: center; min-width: 90px; justify-content: flex-end; } 
-.item-meta { width: 220px; flex-shrink: 0; text-align: right; font-size: 11px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } 
-.item-actions button { background: none; border: none; cursor: pointer; padding: 5px; margin-left: 8px; opacity: 0.7; } 
-.item-actions button:hover { opacity: 1; } 
-.item-actions svg { width: 18px; height: 18px; vertical-align: middle; } 
-#status-message { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background-color: rgba(0,0,0,0.75); color: white; padding: 10px 20px; border-radius: 5px; display: none; z-index: 1002; } 
-.modal { display: none; position: fixed; z-index: 1001; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.4); overflow: auto; } 
-.modal-content { background-color: #fefefe; margin: 2% auto; padding: 10px; border: 1px solid #888; border-radius: 5px; width: 80%; max-width: 500px; max-height: 80vh; overflow-y: auto; box-sizing: border-box; } 
-.close { color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; } 
-.close:hover, .close:focus { color: black; text-decoration: none; } 
-.modal input, .modal select { width: 100%; padding: 8px; margin: 10px 0; box-sizing: border-box; } 
-.modal-buttons { text-align: right; margin-top: 15px; } 
-.modal-buttons button { margin-left: 10px; padding: 8px 15px; border: none; border-radius: 3px; cursor: pointer; } 
-.btn-cancel { background-color: #ccc; } 
-.btn-confirm { background-color: var(--primary-color); color: white; } 
-.btn-danger { background-color: var(--danger-color); color: white; } 
-#editor-modal .modal-content { width: 95%; max-width: 95%; height: 90vh; max-height: 90vh; display: flex; flex-direction: column; } 
-.editor-header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 2px; margin-bottom: 10px; border-bottom: 1px solid var(--border-color); } 
-.editor-header h2 { margin: 0; font-size: 1.1rem; } 
-.editor-toolbar { padding-bottom: 10px; margin-bottom: 10px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; } 
-.editor-toolbar > div { display: flex; gap: 8px; } 
-.editor-toolbar button { padding: 5px 10px; border: 1px solid var(--border-color); background-color: #f8f9fa; border-radius: 4px; cursor: pointer; } 
-.editor-toolbar button:hover { background-color: var(--hover-bg-color); } 
-.editor-toolbar .btn-cancel { background-color: #ccc; color: black; } 
-.editor-toolbar .btn-confirm { background-color: var(--primary-color); color: white; } 
-#editor-textarea { flex-grow: 1; width: 100%; font-family: monospace; font-size: 14px; resize: none; border: 1px solid var(--border-color); border-radius: 4px; padding: 10px; box-sizing: border-box; white-space: pre; overflow-wrap: normal; overflow-x: auto; } 
-#editor-textarea.wrap { white-space: pre-wrap; overflow-wrap: break-word; overflow-x: hidden; } 
-@media (max-width: 768px) { 
-.container { padding: 10px; border-radius: 0; box-shadow: none; } 
-header { flex-wrap: wrap; gap: 10px; } 
-header h1 { font-size: 1.2rem; width: 100%; } 
-.header-buttons { display: flex; gap: 8px; width: 100%; } 
-.header-buttons .upload-btn { flex: 1; text-align: center; font-size: 13px; padding: 10px 8px; } 
-#file-list li { padding: 10px 12px; } 
-.item-icon { width: 20px; height: 20px; margin-right: 10px; } 
-.item-name { font-size: 14px; } 
-.item-meta { display: none; } .item-actions { min-width: auto; } 
-.item-actions button { padding: 6px; margin: 0 1px; } 
-.item-actions svg { width: 20px; height: 20px; } 
-#status-message { left: 10px; right: 10px; transform: none; text-align: center; font-size: 14px; padding: 12px; } 
-.modal-content { width: 95%; margin: 5% auto; max-height: 85vh; } 
-#editor-modal .modal-content { width: 100%; max-width: 100%; height: 100%; max-height: 100%; margin: 0; border-radius: 0; overflow-x: hidden; } 
-.editor-toolbar { flex-wrap: wrap; gap: 6px; } 
-.editor-toolbar button { font-size: 12px; padding: 6px 8px; } 
-#editor-textarea { font-size: 13px; } 
-#path-breadcrumbs { font-size: 0.85rem; } 
-} 
-/* Login page */ 
-#login-page { display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f0f2f5; } 
-.login-box { background: #fff; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 100%; max-width: 360px; } 
-.login-box h2 { text-align: center; margin-bottom: 24px; color: #333; } 
-.login-box input { width: 100%; padding: 12px; margin-bottom: 16px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 14px; } 
-.login-box button { width: 100%; padding: 12px; background: var(--primary-color); color: #fff; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; } 
-.login-box button:hover { background: #0056b3; } 
-.login-box .login-error { color: var(--danger-color); margin-top: 12px; text-align: center; display: none; } 
-.settings-dropdown { position: absolute; top: 100%; right: 0; background: #fff; border: 1px solid var(--border-color); border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); min-width: 180px; display: none; z-index: 1000; } 
-.settings-dropdown.show { display: block; } 
-.settings-dropdown .menu-item { padding: 10px 16px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text-color); } 
-.settings-dropdown .menu-item:hover { background: var(--hover-bg-color); } 
-.settings-dropdown .menu-item svg { width: 18px; height: 18px; flex-shrink: 0; } 
-.settings-dropdown .divider { height: 1px; background: var(--border-color); margin: 4px 0; } 
-.settings-btn-wrap { position: relative; display: inline-flex; } 
-.settings-btn { background: none; border: 1px solid var(--border-color); border-radius: 4px; cursor: pointer; padding: 6px 8px; font-size: 18px; line-height: 1; } 
-.settings-btn:hover { background: var(--hover-bg-color); } 
-.perm-checkboxes { display: flex; gap: 16px; margin: 8px 0; } 
-.perm-checkboxes label { display: flex; align-items: center; gap: 4px; font-size: 13px; cursor: pointer; } 
-.perm-checkboxes input { width: auto; margin: 0; } 
-.token-value { background: #f5f5f5; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 13px; word-break: break-all; margin: 8px 0; user-select: all; } 
-.domain-item, .token-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #f0f0f0; } 
-.domain-item:last-child, .token-item:last-child { border-bottom: none; } 
-.domain-item .badge, .token-item .badge { font-size: 11px; padding: 2px 6px; border-radius: 3px; background: #e8f4fd; color: #007bff; margin-left: 8px; } 
-.header-buttons { display: flex; align-items: center; gap: 8px; } 
-</style> 
-</head> 
-<body> 
-<div id="app"> 
-    <div class="container"> 
-        <header> 
-            <h1>KV 跨域文件管理器</h1> 
-            <div class="header-buttons"> 
-                <button type="button" id="new-file-btn" class="upload-btn" disabled>新建文件</button> 
-                <form id="upload-form" style="display: inline;"> 
-                    <input type="file" id="file-input" multiple> 
-                    <button type="button" id="upload-btn" class="upload-btn" disabled>上传文件</button> 
-                </form> 
-                <div class="settings-btn-wrap"> 
-                    <button class="settings-btn" id="settings-btn" title="设置">&#9881;</button> 
-                    <div class="settings-dropdown" id="settings-dropdown"> 
-                        <div class="menu-item" data-action="user">用户中心</div> 
-                        <div class="menu-item" data-action="domains">域名列表</div> 
-                        <div class="menu-item" data-action="tokens">API 令牌</div> 
-                        <div class="divider"></div> 
-                        <div class="menu-item" data-action="logout">退出</div> 
-                    </div> 
-                </div> 
-            </div> 
-        </header> 
-        <div id="path-breadcrumbs"></div> 
-        <ul id="file-list"></ul> 
-    </div> 
-    <div id="status-message"></div> 
-</div> 
-<script>
-var fm = {};
-fm.bootstrapped = false;
-// 补丁 fetch 自动携带认证头
-(function(){
-  var origFetch=window.fetch;
-  window.fetch=function(url,opts){
-    var creds=sessionStorage.getItem('auth');
-    if(creds){
-      opts=opts||{};
-      opts.headers=opts.headers||{};
-      if(opts.headers instanceof Headers){
-        if(!opts.headers.has('Authorization'))opts.headers.set('Authorization','Basic '+creds);
-      }else{
-        if(!opts.headers['Authorization'])opts.headers['Authorization']='Basic '+creds;
+async function findLightestNode(MY_SCRIPT_BUCKET, allDomains) {
+  const nodeSizes = await computeNodeSizes(MY_SCRIPT_BUCKET, allDomains);
+  let minNode = allDomains[0];
+  let minSize = nodeSizes[minNode] || 0;
+  for (const domain of allDomains) {
+    const size = nodeSizes[domain] || 0;
+    if (size < minSize) {
+      minSize = size;
+      minNode = domain;
+    }
+  }
+  return minNode;
+}
+
+// --- 文件管理器 HTML 页面 ---
+const fileManagerHtml = `
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KV 跨域文件管理器</title>
+  <style>
+    :root {
+      --primary-color: #007bff; --border-color: #dee2e6; --hover-bg-color: #e9ecef;
+      --text-color: #212529; --folder-color: #f7b731; --file-color: #adb5bd;
+      --danger-color: #dc3545; --success-color: #28a745;
+    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; background-color: #f8f9fa; }
+    .container { max-width: 960px; margin: 0 auto; padding: 20px; background-color: #fff; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); }
+    header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 10px; border-bottom: 1px solid var(--border-color); margin-bottom: 20px; gap: 8px; }
+    h1 { font-size: 1.75rem; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex-shrink: 1; }
+    #file-input { display: none; }
+    .upload-btn { background-color: var(--primary-color); color: white; padding: 8px 12px; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; white-space: nowrap; }
+    .header-buttons { display: flex; align-items: center; gap: 14px; flex-shrink: 0; }
+    .settings-btn { background: none; border: 1px solid var(--border-color); border-radius: 4px; cursor: pointer; padding: 8px 10px; font-size: 14px; line-height: 1; }
+    .upload-btn:hover { background-color: #0056b3; }
+    .upload-btn:disabled { background-color: #a0a0a0; cursor: not-allowed; }
+    #path-breadcrumbs { font-size: 1rem; margin-bottom: 20px; color: #6c757d; white-space: nowrap; overflow-x: auto; }
+    #file-list { list-style: none; padding: 0; border: 1px solid var(--border-color); border-radius: 5px; }
+    #file-list li { display: flex; align-items: center; padding: 12px 15px; border-bottom: 1px solid var(--border-color); transition: background-color 0.2s; }
+    #file-list li:last-child { border-bottom: none; }
+    #file-list li:hover { background-color: var(--hover-bg-color); }
+    .item-icon { width: 24px; height: 24px; margin-right: 15px; flex-shrink: 0; }
+    .item-name { flex: 1; cursor: pointer; color: var(--text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .item-name.folder { font-weight: 500; }
+    /* 多选相关 */
+    .file-checkbox { margin: 0 10px 0 4px; width: 16px; height: 16px; cursor: pointer; flex-shrink: 0; }
+    #file-list li.selected { background-color: #e8f0fe; }
+    #selection-bar { display: none; align-items: center; gap: 8px; margin-bottom: 10px; padding: 8px 12px; background: #f0f8ff; border-radius: 5px; font-size: 13px; }
+    #selection-bar.show { display: flex; flex-wrap: wrap; }
+    #selection-bar label { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; white-space: nowrap; }
+    #selection-bar label input { width: auto; margin: 0; }
+    #select-count { color: #666; white-space: nowrap; }
+    #delete-selected-btn { padding: 6px 12px; background: var(--danger-color); color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; white-space: nowrap; }
+    #delete-selected-btn:disabled { background: #ccc; cursor: not-allowed; }
+    /* 选择栏中的概览（桌面端） */
+    .bar-stats { display: flex; align-items: center; gap: 4px; font-size: 13px; color: #555; white-space: nowrap; }
+    /* 桌面端：path-breadcrumbs隐藏，概览在选择栏内 */
+    @media (min-width: 769px) {
+      #path-breadcrumbs { display: none; }
+      #selection-bar.show { flex-wrap: nowrap; }
+      .bar-spacer { flex: 1; }
+    }
+    /* 手机端：概览在上，选择栏在下 */
+    @media (max-width: 768px) {
+      #path-breadcrumbs { display: block; margin-bottom: 2px; padding: 6px 8px; font-size: 12px; }
+      #selection-bar.show { display: flex; margin-top: 0; padding: 6px 2px 6px 8px; }
+      .bar-stats { display: none; }
+      #delete-selected-btn { margin-left: auto; margin-right: 0; }
+      .file-checkbox { margin-left: -4px; }
+    }
+    .item-actions { display: flex; align-items: center; min-width: 90px; justify-content: flex-end; }
+    .item-meta { width: 220px; flex-shrink: 0; text-align: right; font-size: 11px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .item-actions button { background: none; border: none; cursor: pointer; padding: 5px; margin-left: 8px; opacity: 0.7; }
+    .item-actions button:hover { opacity: 1; }
+    .item-actions svg { width: 18px; height: 18px; vertical-align: middle; }
+
+    /* 令牌管理弹窗中的操作按钮（复制/编辑/删除） */
+    .token-item .item-actions button { padding: 7px; margin-left: 8px; }
+    .token-item .item-actions svg { width: 22px; height: 22px; }
+
+    #status-message { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background-color: rgba(0,0,0,0.75); color: white; padding: 10px 20px; border-radius: 5px; display: none; z-index: 1002; }
+    
+    /* Modal styles */
+    .modal { display: none; position: fixed; z-index: 1001; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.4); overflow: auto; }
+    .modal-content { background-color: #fefefe; margin: 2% auto; padding: 10px; border: 1px solid #888; border-radius: 5px; width: 80%; max-width: 500px; max-height: 80vh; overflow-y: auto; box-sizing: border-box; }
+    .close { color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; }
+    .close:hover, .close:focus { color: black; text-decoration: none; }
+    .modal input, .modal select { width: 100%; padding: 8px; margin: 10px 0; box-sizing: border-box; }
+    .modal-buttons { text-align: right; margin-top: 15px; }
+    .modal-buttons button { margin-left: 10px; padding: 8px 15px; border: none; border-radius: 3px; cursor: pointer; }
+    .btn-cancel { background-color: #ccc; }
+    .btn-confirm { background-color: var(--primary-color); color: white; }
+    .btn-danger { background-color: var(--danger-color); color: white; }
+    
+    #editor-modal .modal-content { 
+      width: 95%; max-width: 95%; height: 90vh; max-height: 90vh; display: flex; flex-direction: column; 
+    }
+    .editor-header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 2px; margin-bottom: 10px; border-bottom: 1px solid var(--border-color); }
+    .editor-header h2 { margin: 0; font-size: 1.1rem; }
+    .editor-header .close { font-size: 1.5rem; line-height: 1; }
+    .editor-toolbar { padding-bottom: 10px; margin-bottom: 10px; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; }
+    .editor-toolbar > div { display: flex; gap: 8px; }
+    .editor-toolbar button { padding: 5px 10px; border: 1px solid var(--border-color); background-color: #f8f9fa; border-radius: 4px; cursor: pointer; }
+    .editor-toolbar button:hover { background-color: var(--hover-bg-color); }
+    .editor-toolbar .btn-cancel { background-color: #ccc; color: black; }
+    .editor-toolbar .btn-confirm { background-color: var(--primary-color); color: white; }
+    #editor-textarea { flex-grow: 1; width: 100%; font-family: monospace; font-size: 14px; resize: none; border: 1px solid var(--border-color); border-radius: 4px; padding: 10px; box-sizing: border-box; white-space: pre; overflow-wrap: normal; overflow-x: auto; }
+    #editor-textarea.wrap { white-space: pre-wrap; overflow-wrap: break-word; overflow-x: hidden; }
+
+    @media (max-width: 768px) {
+      .container { padding: 10px; border-radius: 0; box-shadow: none; }
+      header { flex-wrap: wrap; gap: 10px; margin-bottom: 6px; }
+      header h1 { font-size: 1.2rem; width: 100%; }
+      .header-buttons { display: flex; gap: 10px; width: 100%; }
+      .header-buttons .upload-btn { flex: 1; text-align: center; font-size: 13px; padding: 10px 8px; }
+      #upload-form { flex: 1; display: flex; }
+      #upload-form .upload-btn { width: 100%; }
+      #file-list li { padding: 10px 2px 10px 12px; }
+      .item-icon { width: 20px; height: 20px; margin-right: 10px; }
+      .item-name { font-size: 14px; }
+      .item-meta { display: none; }
+      .item-actions { min-width: auto; }
+      .item-actions button { padding: 4px; margin: 0; }
+      .item-actions svg { width: 18px; height: 18px; }
+      .token-item .item-actions button { padding: 8px; margin: 0 1px; }
+      .token-item .item-actions svg { width: 24px; height: 24px; }
+      #status-message { left: 10px; right: 10px; transform: none; text-align: center; font-size: 14px; padding: 12px; }
+      .modal-content { width: 95%; margin: 5% auto; max-height: 85vh; }
+      #editor-modal .modal-content { width: 100%; max-width: 100%; height: 100%; max-height: 100%; margin: 0; border-radius: 0; overflow-x: hidden; }
+      .editor-header h2 { font-size: 0.95rem; }
+      .editor-header h2 span { max-width: 200px; display: inline-block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+      .editor-toolbar { flex-wrap: wrap; gap: 6px; }
+      .editor-toolbar > div { flex-wrap: wrap; }
+      .editor-toolbar button { font-size: 12px; padding: 6px 8px; }
+      #editor-textarea { font-size: 13px; }
+      #path-breadcrumbs { font-size: 0.85rem; }
+    }
+
+    /* Login page - 默认隐藏，防止刷新时白框闪烁 */
+    #login-page { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 9999; display: none; justify-content: center; align-items: center; background: #f0f2f5; box-sizing: border-box; }
+    .login-box { background: #fff; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); width: 100%; max-width: 360px; box-sizing: border-box; }
+    .login-box h2 { text-align: center; margin-bottom: 24px; color: #333; }
+    .login-box input { width: 100%; padding: 12px; margin-bottom: 16px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; font-size: 14px; }
+    .login-box button { width: 100%; padding: 12px; background: var(--primary-color); color: #fff; border: none; border-radius: 4px; font-size: 16px; cursor: pointer; }
+    .login-box button:hover { background: #0056b3; }
+    .login-box .login-error { color: var(--danger-color); margin-top: 12px; text-align: center; display: none; }
+
+    @media (max-width: 768px) {
+      #login-page { padding: 10px; align-items: flex-start; padding-top: 15vh; }
+      .login-box { padding: 24px 20px; max-width: 100%; border-radius: 12px; box-sizing: border-box; width: auto; margin: 0 10px; }
+      .login-box h2 { font-size: 1.2rem; margin-bottom: 20px; }
+      .login-box input { padding: 14px 12px; font-size: 16px; }
+      .login-box button { padding: 14px; font-size: 16px; }
+      .container { padding: 10px; border-radius: 0; box-shadow: none; }
+      header { flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+      header h1 { font-size: 1.2rem; width: 100%; }
+      .header-buttons { display: flex; gap: 10px; width: 100%; }
+      .header-buttons .upload-btn { flex: 1; text-align: center; font-size: 13px; padding: 10px 8px; }
+      #upload-form { flex: 1; display: flex; }
+      #upload-form .upload-btn { width: 100%; }
+      .settings-btn { font-size: 16px; padding: 10px 12px; }
+    }
+    @media (max-width: 480px) {
+      #login-page { padding-top: 10vh; }
+      .login-box { padding: 20px 16px; box-sizing: border-box; width: auto; margin: 0 8px; }
+      .login-box h2 { font-size: 1.05rem; margin-bottom: 16px; }
+      .login-box input { padding: 12px 10px; margin-bottom: 12px; }
+      .login-box button { padding: 12px; }
+    }
+
+    /* 默认隐藏APP，JS渲染完毕后显示，防止刷新时白框闪烁 */
+    #app { display: none; }
+    .settings-dropdown { position: absolute; top: 100%; right: 0; background: #fff; border: 1px solid var(--border-color); border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); min-width: 180px; display: none; z-index: 1000; }
+    .settings-dropdown.show { display: block; }
+    .settings-dropdown .menu-item { padding: 10px 16px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text-color); }
+    .settings-dropdown .menu-item:hover { background: var(--hover-bg-color); }
+    .settings-dropdown .menu-item svg { width: 18px; height: 18px; flex-shrink: 0; }
+    .settings-dropdown .divider { height: 1px; background: var(--border-color); margin: 4px 0; }
+    .settings-btn-wrap { position: relative; display: inline-flex; }
+    .settings-btn:hover { background: var(--hover-bg-color); }
+    .perm-checkboxes { display: flex; gap: 16px; margin: 8px 0; }
+    .perm-checkboxes label { display: flex; align-items: center; gap: 4px; font-size: 13px; cursor: pointer; }
+    .perm-checkboxes input { width: auto; margin: 0; }
+    .token-value { background: #f5f5f5; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 13px; word-break: break-all; margin: 8px 0; user-select: all; }
+    .domain-item, .token-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #f0f0f0; }
+    .domain-item:last-child, .token-item:last-child { border-bottom: none; }
+    .domain-item .badge, .token-item .badge { font-size: 11px; padding: 2px 6px; border-radius: 3px; background: #e8f4fd; color: #007bff; margin-left: 8px; }
+  </style>
+</head>
+<body>
+  <div id="login-page">
+    <div class="login-box" id="login-content"></div>
+  </div>
+
+  <div id="app">
+  <div class="container">
+    <header>
+      <h1>📁 统一文件管理器</h1>
+      <div class="header-buttons">
+        <button type="button" id="new-file-btn" class="upload-btn" onclick="showNewFileModal()">新建文件</button>
+        <form id="upload-form" style="display: inline;">
+          <input type="file" id="file-input" multiple onchange="handleUpload(event)">
+          <button type="button" id="upload-btn" class="upload-btn" onclick="document.getElementById('file-input').click();">上传文件</button>
+        </form>
+        <div class="settings-btn-wrap">
+          <button class="settings-btn" id="settings-btn" title="设置" onclick="toggleSettings(event)">⚙️</button>
+          <div class="settings-dropdown" id="settings-dropdown">
+            <div class="menu-item" onclick="menuAction('user')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>修改密码</div>
+            <div class="menu-item" onclick="menuAction('domains')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>域名列表</div>
+            <div class="menu-item" onclick="menuAction('tokens')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>API 令牌</div>
+            <div class="divider"></div>
+            <div class="menu-item" onclick="menuAction('logout')"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z"/></svg>退出</div>
+          </div>
+        </div>
+      </div>
+    </header>
+    <div id="path-breadcrumbs"></div>
+    <div id="selection-bar">
+      <label><input type="checkbox" id="select-all" onchange="toggleSelectAll()"> 全选</label>
+      <span id="select-count">已选 0 个</span>
+      <button id="delete-selected-btn" disabled onclick="deleteSelected()">🗑 删除选中</button>
+      <span class="bar-spacer"></span>
+      <span class="bar-stats" id="bar-stats"></span>
+    </div>
+    <ul id="file-list"></ul>
+  </div>
+  
+  <div id="editor-modal" class="modal">
+    <div class="modal-content">
+      <div class="editor-header">
+        <h2>编辑文件: <span id="editor-filename"></span></h2>
+        <span class="close">&times;</span>
+      </div>
+      <div class="editor-toolbar">
+        <div>
+          <button id="wrap-toggle-btn" title="切换自动换行">换行</button>
+          <button id="format-json-btn" title="格式化JSON">格式化JSON</button>
+          <button id="minify-json-btn" title="压缩JSON">压缩JSON</button>
+        </div>
+        <div>
+          <button class="btn-cancel">取消</button>
+          <button class="btn-confirm" id="save-editor">保存</button>
+        </div>
+      </div>
+      <textarea id="editor-textarea"></textarea>
+    </div>
+  </div>
+  
+  <div id="new-file-modal" class="modal">
+    <div class="modal-content">
+      <span class="close">&times;</span>
+      <h2>新建文件</h2>
+      <label for="new-filename">文件名:</label>
+      <input type="text" id="new-filename" placeholder="例如: new-file.txt">
+      <div class="modal-buttons">
+        <button class="btn-cancel">取消</button>
+        <button class="btn-confirm" id="confirm-new-file">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="settings-modal" class="modal">
+    <div class="modal-content">
+      <span class="close">&times;</span>
+      <h2 id="settings-modal-title"></h2>
+      <div id="settings-modal-body"></div>
+    </div>
+  </div>
+
+  <div id="create-token-modal" class="modal">
+    <div class="modal-content" style="max-width:400px">
+      <span class="close">&times;</span>
+      <h2>创建 API 令牌</h2>
+      <label>令牌名称</label>
+      <input type="text" id="ct-name" placeholder="令牌名称">
+      <div style="margin:12px 0 8px;font-size:13px;color:#666">权限</div>
+      <div class="perm-checkboxes">
+        <label><input type="checkbox" id="ct-upload" checked> 上传</label>
+        <label><input type="checkbox" id="ct-download" checked> 下载</label>
+        <label><input type="checkbox" id="ct-delete"> 删除</label>
+      </div>
+      <div class="modal-buttons">
+        <button class="btn-cancel">取消</button>
+        <button class="btn-confirm" id="ct-create">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="status-message"></div>
+
+  <script>
+  // 初始化：默认登录页可见、APP隐藏（由CSS控制）
+  // 核心按钮函数（自包含，不依赖其他JS）
+  function toggleSettings(e) {
+    e.stopPropagation();
+    var d = document.getElementById('settings-dropdown');
+    if (d) d.classList.toggle('show');
+  }
+  function showNewFileModal() {
+    var el = document.getElementById('new-filename');
+    if (el) el.value = '';
+    var m = document.getElementById('new-file-modal');
+    if (m) m.style.display = 'block';
+  }
+  function handleUpload(e) {
+    var files = e.target.files;
+    if (!files || !files.length) return;
+    for (var i = 0; i < files.length; i++) {
+      (function(file) {
+        var fd = new FormData();
+        var xhr = new XMLHttpRequest();
+        xhr.open('PUT', '/update/' + encodeURIComponent(file.name), true);
+        xhr.onload = function() { location.reload(); };
+        xhr.send(file);
+      })(files[i]);
+    }
+    e.target.value = '';
+  }
+  function menuAction(action) {
+    var d = document.getElementById('settings-dropdown');
+    if (d) d.classList.remove('show');
+    if (action === 'logout') { sessionStorage.removeItem('auth'); location.href = '/'; }
+    else if (action === 'user') { var m = document.getElementById('settings-modal'); if (m) { document.getElementById('settings-modal-title').textContent = '修改密码'; document.getElementById('settings-modal-body').innerHTML = '加载中...'; m.style.display = 'block'; } }
+    else if (action === 'domains') { var m = document.getElementById('settings-modal'); if (m) { document.getElementById('settings-modal-title').textContent = '域名列表'; document.getElementById('settings-modal-body').innerHTML = '加载中...'; m.style.display = 'block'; } }
+    else if (action === 'tokens') { var m = document.getElementById('settings-modal'); if (m) { document.getElementById('settings-modal-title').textContent = 'API 令牌管理'; document.getElementById('settings-modal-body').innerHTML = '加载中...'; m.style.display = 'block'; } }
+  }
+  // 从令牌列表复制完整令牌
+  function copyFullToken(index) {
+    fetch('/tokens').then(function(r) { return r.json(); }).then(function(list) {
+      var t = list[index];
+      if (!t || !t.token_full) { alert('未找到令牌'); return; }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(t.token_full).then(function() { alert('已复制令牌: ' + t.token_full.slice(0,8) + '...'); });
+      } else {
+        var ta = document.createElement('textarea');
+        ta.value = t.token_full; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        document.execCommand('copy'); document.body.removeChild(ta);
+        alert('已复制令牌: ' + t.token_full.slice(0,8) + '...');
+      }
+    }).catch(function() { alert('获取令牌失败'); });
+  }
+  </script>
+  <script>
+    const icons = {
+      folder: '<svg class="item-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="var(--folder-color)"><path d="M10 4H4c-1.1 0-2 .89-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>',
+      file: '<svg class="item-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="var(--file-color)"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zM13 9V3.5L18.5 9H13z"/></svg>',
+      edit: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zM6 20V4h7v5h5v11H6z"/><rect x="8" y="12" width="8" height="1.2" rx="0.6"/><rect x="8" y="14.5" width="6" height="1.2" rx="0.6"/><rect x="8" y="17" width="5" height="1.2" rx="0.6"/></svg>',
+      download: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>',
+      delete: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="var(--danger-color)"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>',
+      rename: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>',
+      copy: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>',
+    };
+
+    let currentFileForOperation = null;
+    let bootstrapped = false;
+
+    // 全局函数（支持内联 onclick 调用）
+    function toggleSettings(e) {
+      e.stopPropagation();
+      const d = document.getElementById('settings-dropdown');
+      if (d) d.classList.toggle('show');
+    }
+    document.addEventListener('click', function() {
+      const d = document.getElementById('settings-dropdown');
+      if (d) d.classList.remove('show');
+    });
+    function showNewFileModal() {
+      const el = document.getElementById('new-filename');
+      if (el) el.value = '';
+      const m = document.getElementById('new-file-modal');
+      if (m) m.style.display = 'block';
+    }
+    function handleUpload(e) {
+      // 转发到 handleFileUpload
+      handleFileUpload(e);
+    }
+    function menuAction(action) {
+      const d = document.getElementById('settings-dropdown');
+      if (d) d.classList.remove('show');
+      if (action === 'logout') { sessionStorage.removeItem('auth'); location.href = '/'; }
+      else if (action === 'user') showUserCenter();
+      else if (action === 'domains') showDomainList();
+      else if (action === 'tokens') showTokenList();
+    }
+
+    // Patch fetch to include auth header
+    const origFetch = window.fetch;
+    window.fetch = function(url, opts) {
+      const creds = sessionStorage.getItem('auth');
+      if (creds) {
+        opts = opts || {};
+        opts.headers = opts.headers || {};
+        if (!opts.headers['Authorization']) opts.headers['Authorization'] = 'Basic ' + creds;
+      }
+      return origFetch.call(window, url, opts);
+    };
+
+    document.addEventListener('DOMContentLoaded', () => {
+      setupSettings();
+      // 查询服务端认证状态，实时判断（支持HTML边缘缓存）
+      fetch('/auth/status').then(r => r.json()).then(status => {
+        if (!status.configured) {
+          // 未设置管理员密码：直接进入APP，弹窗提示设置
+          showApp();
+          setTimeout(() => showUserCenter(), 300);
+        } else if (sessionStorage.getItem('auth')) {
+          checkAuth().then(ok => ok ? showApp() : (sessionStorage.removeItem('auth'), showLogin()));
+        } else {
+          showLogin();
+        }
+      }).catch(() => {
+        // 请求失败时保守处理：显示登录页
+        showLogin();
+      });
+    });
+
+    function showLoginPage() {
+      document.getElementById('login-page').style.display = 'flex';
+    }
+
+    function showLogin() {
+      const box = document.getElementById('login-content');
+      box.innerHTML =
+        '<h2>文件管理器登录</h2>' +
+        '<input type="text" id="li-user" placeholder="用户名" autocomplete="username">' +
+        '<input type="password" id="li-pass" placeholder="密码" autocomplete="current-password">' +
+        '<button id="li-btn">登 录</button>' +
+        '<div class="login-error" id="li-err" style="display:none"></div>';
+      document.getElementById('li-btn').onclick = doLogin;
+      document.getElementById('li-user').onkeydown = e => { if (e.key === 'Enter') doLogin(); };
+      document.getElementById('li-pass').onkeydown = e => { if (e.key === 'Enter') doLogin(); };
+      document.getElementById('li-user').focus();
+      showLoginPage();
+    }
+
+    async function doLogin() {
+      const user = document.getElementById('li-user').value.trim();
+      const pass = document.getElementById('li-pass').value;
+      const err = document.getElementById('li-err');
+      if (!user || !pass) { err.textContent = '请输入用户名和密码'; err.style.display = 'block'; return; }
+      const encoded = btoa(user + ':' + pass);
+      sessionStorage.setItem('auth', encoded);
+      if (await checkAuth()) {
+        err.style.display = 'none';
+        document.getElementById('login-page').style.display = 'none';
+        showApp();
+      } else {
+        sessionStorage.removeItem('auth');
+        err.textContent = '用户名或密码错误';
+        err.style.display = 'block';
       }
     }
-    return origFetch.call(window,url,opts);
-  };
-})();
-fm.checkAuth = function() {
-  return fetch('/auth/check').then(function(r){return r.json();}).then(function(d){
-    return {authenticated:d.authenticated,needSetup:d.needSetup};
-  }).catch(function(){return {authenticated:false,needSetup:true};});
-};
-fm.showStatus = function(msg,err,dur){
-  var el=document.getElementById('status-message');
-  if(!el)return;
-  el.textContent=msg;
-  el.style.backgroundColor=err?'#dc3545':'rgba(0,0,0,0.75)';
-  el.style.display='block';
-  setTimeout(function(){el.style.display='none';},dur||3000);
-};
-fm.render = function(){
-  Promise.all([fetch('/list-all'),fetch('/stats')]).then(function(resps){
-    if(!resps[0].ok)throw new Error('获取文件列表失败');
-    return Promise.all([resps[0].json(),resps[1].json().catch(function(){return null;})]);
-  }).then(function(data){
-    var files=data[0].files||[],stats=data[1];
-    var el=document.getElementById('file-list');
-    if(!el)return;
-    el.innerHTML='';
-    if(!files.length){
-      var li=document.createElement('li');
-      li.textContent='暂无文件';
-      el.appendChild(li);
-      return;
+
+    function showApp() {
+      document.getElementById('app').style.display = 'block';
+      document.getElementById('login-page').style.display = 'none';
+      // 加载页面数据（文件列表 + 统计 + 域名引导，一步到位）
+      render();
+      document.getElementById('file-input').addEventListener('change', handleFileUpload);
+      setupModalEvents();
     }
-    files.sort(function(a,b){return a.filename.localeCompare(b.filename);});
-    files.forEach(function(item){
-      var li=document.createElement('li');
-      li.textContent=item.filename+' ('+item.node+')';
-      el.appendChild(li);
-    });
-    var bc=document.getElementById('path-breadcrumbs');
-    if(bc&&stats)bc.innerHTML='文件总数: '+stats.total+' | 总大小: '+fm.formatSize(stats.totalSize);
-  }).catch(function(e){fm.showStatus('错误: '+e.message,true);});
-};
-fm.formatSize = function(b){
-  if(!b)return'0B';
-  if(b>1048576)return(b/1048576).toFixed(1)+'MB';
-  if(b>1024)return(b/1024).toFixed(1)+'KB';
-  return b+'B';
-};
-fm.init = function(){
-  fm.checkAuth().then(function(auth){
-    if(auth.authenticated){
-      fm.render();
-      document.getElementById('file-input').addEventListener('change',function(e){
-        var files=e.target.files;
-        if(!files.length)return;
-        for(var i=0;i<files.length;i++){
-          (function(file){
-            fetch('/update/'+encodeURIComponent(file.name),{method:'PUT',body:file}).then(function(r){
-              if(r.ok)fm.showStatus('上传成功: '+file.name);
-              else fm.showStatus('上传失败',true);
-              fm.render();
-            });
-          })(files[i]);
-        }
-        e.target.value='';
+
+    async function checkAuth() {
+      try {
+        const resp = await fetch('/auth/check');
+        const data = await resp.json();
+        return data.authenticated;
+      } catch { return false; }
+    }
+
+    function setupSettings() {
+      const settingsBtn = document.getElementById('settings-btn');
+      const dropdown = document.getElementById('settings-dropdown');
+      settingsBtn.onclick = (e) => {
+        e.stopPropagation();
+        dropdown.classList.toggle('show');
+      };
+      document.addEventListener('click', () => dropdown.classList.remove('show'));
+
+      dropdown.querySelectorAll('.menu-item[data-action]').forEach(item => {
+        item.onclick = (e) => {
+          e.stopPropagation();
+          dropdown.classList.remove('show');
+          const action = item.dataset.action;
+          if (action === 'logout') {
+            sessionStorage.removeItem('auth');
+            location.reload();
+          } else if (action === 'user') {
+            showUserCenter();
+          } else if (action === 'domains') {
+            showDomainList();
+          } else if (action === 'tokens') {
+            showTokenList();
+          }
+        };
       });
-      document.getElementById('new-file-btn').disabled=false;
-      document.getElementById('upload-btn').disabled=false;
-    }else{
-      window.location.href='/';
     }
-  });
-};
-window.addEventListener('DOMContentLoaded',fm.init);
-</script>
-</body> 
-</html> 
+
+    function showUserCenter() {
+      const modal = document.getElementById('settings-modal');
+      const title = document.getElementById('settings-modal-title');
+      const body = document.getElementById('settings-modal-body');
+      title.textContent = '修改密码';
+      body.innerHTML = '<div style="margin-bottom:16px;padding:8px 0;border-bottom:1px solid #f0f0f0"><strong>修改管理员密码</strong></div>' +
+        '<label>新用户名</label>' +
+        '<input type="text" id="sc-username" placeholder="新用户名">' +
+        '<label>新密码</label>' +
+        '<input type="password" id="sc-password" placeholder="新密码">' +
+        '<label>确认密码</label>' +
+        '<input type="password" id="sc-password2" placeholder="再次输入新密码">' +
+        '<div class="modal-buttons">' +
+        '<button class="btn-cancel">取消</button>' +
+        '<button class="btn-confirm" id="sc-save">保存</button>' +
+        '</div>';
+      modal.style.display = 'block';
+      modal.querySelector('.close').onclick = () => modal.style.display = 'none';
+      modal.querySelector('.btn-cancel').onclick = () => modal.style.display = 'none';
+      document.getElementById('sc-save').onclick = async () => {
+        const username = document.getElementById('sc-username').value.trim();
+        const password = document.getElementById('sc-password').value;
+        const password2 = document.getElementById('sc-password2').value;
+        if (!username || !password) { showStatus('请填写用户名和密码', true); return; }
+        if (password !== password2) { showStatus('两次密码不一致', true); return; }
+        let resp = await fetch('/auth/setup', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password })
+        });
+        // 如果已设过密码，改用 /auth/credentials
+        if (resp.status === 400) {
+          resp = await fetch('/auth/credentials', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+          });
+        }
+        if (resp.ok) {
+          const encoded = btoa(username + ':' + password);
+          sessionStorage.setItem('auth', encoded);
+          modal.style.display = 'none';
+          showStatus('密码设置成功');
+          // 首次设置密码后，立即引导绑定节点（仅首次，后续不进入此分支）
+          setTimeout(async () => {
+            const domain = prompt('请输入已绑定的域名地址（留空表示本节点为首个节点），例如: backup.example.com');
+            if (domain !== null && domain.trim()) {
+              const syncResp = await fetch('/sync/pull-from', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ domain: domain.trim() })
+              });
+              if (syncResp.ok) showStatus('数据同步成功');
+              else showStatus('同步失败', true);
+            } else {
+              await fetch('/domains', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ domain: '' })
+              });
+              showStatus('已初始化为首个节点');
+            }
+            render();
+          }, 500);
+        } else {
+          const txt = await resp.text();
+          showStatus(txt.trim() || '设置失败', true);
+        }
+      };
+    }
+
+    async function showDomainList() {
+      const modal = document.getElementById('settings-modal');
+      const title = document.getElementById('settings-modal-title');
+      const body = document.getElementById('settings-modal-body');
+      title.textContent = '域名列表';
+      body.innerHTML = '<div style="text-align:center;padding:20px">加载中...</div>';
+      modal.style.display = 'block';
+      modal.querySelector('.close').onclick = () => modal.style.display = 'none';
+      try {
+        const resp = await fetch('/domains');
+        const data = await resp.json();
+        let html = '<div style="margin-bottom:12px">已绑定的域名（仅查看）</div>';
+        data.domains.forEach(d => {
+          const isKv = data.kvDomains.includes(d);
+          html += '<div class="domain-item"><span>' + d + (isKv ? '<span class="badge">KV</span>' : '') + '</span></div>';
+        });
+        if (data.domains.length === 0) html += '<div style="color:#888;padding:8px">暂无域名</div>';
+        body.innerHTML = html;
+      } catch (e) {
+        body.innerHTML = '<div style="color:var(--danger-color)">加载失败</div>';
+      }
+    }
+
+    async function showTokenList() {
+      const modal = document.getElementById('settings-modal');
+      const title = document.getElementById('settings-modal-title');
+      const body = document.getElementById('settings-modal-body');
+      title.textContent = 'API 令牌管理';
+      body.innerHTML = '<div style="text-align:center;padding:20px">加载中...</div>';
+      modal.style.display = 'block';
+      modal.querySelector('.close').onclick = () => modal.style.display = 'none';
+      try {
+        const resp = await fetch('/tokens');
+        const tokens = await resp.json();
+        let html = '';
+        tokens.forEach((t, i) => {
+          const perms = [];
+          if (t.permissions.download) perms.push('下载');
+          if (t.permissions.upload) perms.push('上传');
+          if (t.permissions.delete) perms.push('删除');
+          html += '<div class="token-item">';
+          html += '<div><strong>' + t.name + '</strong><br><span style="font-size:12px;color:#888;font-family:monospace">' + t.token + '</span><br><span style="font-size:11px;color:#666">' + perms.join(' / ') + '</span></div>';
+          html += '<div class="item-actions">';
+          html += '<button title="复制" onclick="copyFullToken(' + i + ')">' + icons.copy + '</button>';
+          html += '<button title="编辑" onclick="editToken(' + i + ')">' + icons.edit + '</button>';
+          html += '<button title="删除" onclick="deleteToken(' + i + ')">' + icons.delete + '</button>';
+          html += '</div></div>';
+        });
+        if (tokens.length === 0) html += '<div style="color:#888;padding:8px">暂无令牌</div>';
+        // 分割线
+        html += '<div class="divider"></div>';
+        // 仅一个创建按钮
+        html += '<div style="margin-top:8px"><button class="btn-confirm" style="width:100%;padding:10px;font-size:14px" onclick="showCreateTokenModal()">+ 创建 API 令牌</button></div>';
+        body.innerHTML = html;
+      } catch (e) {
+        body.innerHTML = '<div style="color:var(--danger-color)">加载失败</div>';
+      }
+    }
+
+    async function createTokenFromModal() {
+      const name = document.getElementById('ct-name').value.trim() || '未命名';
+      const permissions = {
+        upload: document.getElementById('ct-upload').checked,
+        download: document.getElementById('ct-download').checked,
+        delete: document.getElementById('ct-delete').checked
+      };
+      const resp = await fetch('/tokens', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, permissions })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        document.getElementById('ct-name').value = '';
+        document.getElementById('create-token-modal').style.display = 'none';
+        // 先刷新令牌列表，再显示生成的令牌
+        await showTokenList();
+        showStatus('令牌创建成功: ' + data.token.token.slice(0,8) + '...（请立即复制保存）');
+      } else {
+        showStatus('生成失败', true);
+      }
+    }
+
+    function showCreateTokenModal() {
+      const modal = document.getElementById('create-token-modal');
+      document.getElementById('ct-name').value = '';
+      document.getElementById('ct-upload').checked = true;
+      document.getElementById('ct-download').checked = true;
+      document.getElementById('ct-delete').checked = false;
+      modal.style.display = 'block';
+    }
+
+    function editToken(index) {
+      const body = document.getElementById('settings-modal-body');
+      const origHtml = body.innerHTML;
+      body.innerHTML = '<div style="margin-bottom:8px"><strong>编辑令牌 #' + (index + 1) + '</strong></div>' +
+        '<label>令牌名称</label>' +
+        '<input type="text" id="et-name" placeholder="名称">' +
+        '<div class="perm-checkboxes">' +
+        '<label><input type="checkbox" id="et-download"> 下载</label>' +
+        '<label><input type="checkbox" id="et-upload"> 上传</label>' +
+        '<label><input type="checkbox" id="et-delete"> 删除</label>' +
+        '</div>' +
+        '<div class="modal-buttons">' +
+        '<button class="btn-cancel" onclick="showTokenList()">取消</button>' +
+        '<button class="btn-confirm" id="et-save">保存</button>' +
+        '</div>';
+      fetch('/tokens').then(r => r.json()).then(tokens => {
+        const t = tokens[index];
+        document.getElementById('et-name').value = t.name;
+        document.getElementById('et-download').checked = t.permissions.download;
+        document.getElementById('et-upload').checked = t.permissions.upload;
+        document.getElementById('et-delete').checked = t.permissions.delete;
+      });
+      document.getElementById('et-save').onclick = async () => {
+        const name = document.getElementById('et-name').value.trim();
+        const permissions = {
+          download: document.getElementById('et-download').checked,
+          upload: document.getElementById('et-upload').checked,
+          delete: document.getElementById('et-delete').checked
+        };
+        const resp = await fetch('/tokens/' + index, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, permissions })
+        });
+        if (resp.ok) {
+          showStatus('修改成功');
+          showTokenList();
+        } else {
+          showStatus('修改失败', true);
+        }
+      };
+    }
+
+    async function deleteToken(index) {
+      if (!confirm('确定删除该令牌？')) return;
+      const resp = await fetch('/tokens/' + index, { method: 'DELETE' });
+      if (resp.ok) { showStatus('已删除'); showTokenList(); }
+      else showStatus('删除失败', true);
+    }
+
+    function setupModalEvents() {
+      document.getElementById('new-file-btn').onclick = () => {
+        document.getElementById('new-filename').value = '';
+        document.getElementById('new-file-modal').style.display = 'block';
+      };
+      document.getElementById('new-file-modal').querySelector('.close').onclick = () => {
+        document.getElementById('new-file-modal').style.display = 'none';
+      };
+      document.getElementById('new-file-modal').querySelector('.btn-cancel').onclick = () => {
+        document.getElementById('new-file-modal').style.display = 'none';
+      };
+      document.getElementById('confirm-new-file').onclick = handleNewFileConfirm;
+      
+      document.getElementById('editor-modal').querySelector('.close').onclick = () => {
+        document.getElementById('editor-modal').style.display = 'none';
+      };
+      document.getElementById('editor-modal').querySelector('.btn-cancel').onclick = () => {
+        document.getElementById('editor-modal').style.display = 'none';
+      };
+      document.getElementById('save-editor').onclick = handleSaveEditor;
+      document.getElementById('format-json-btn').onclick = () => formatJson(true);
+      document.getElementById('minify-json-btn').onclick = () => formatJson(false);
+      document.getElementById('wrap-toggle-btn').onclick = toggleWrap;
+      
+      window.onclick = function(event) {
+        if (event.target.classList.contains('modal')) {
+          event.target.style.display = 'none';
+        }
+      };
+
+      // 创建令牌弹窗事件
+      const ctModal = document.getElementById('create-token-modal');
+      ctModal.querySelector('.close').onclick = () => { ctModal.style.display = 'none'; };
+      ctModal.querySelector('.btn-cancel').onclick = () => { ctModal.style.display = 'none'; };
+      document.getElementById('ct-create').onclick = createTokenFromModal;
+    }
+
+    function showStatus(message, isError = false, duration = 3000) {
+      const statusElement = document.getElementById('status-message');
+      statusElement.textContent = message;
+      statusElement.style.backgroundColor = isError ? 'var(--danger-color)' : 'rgba(0,0,0,0.75)';
+      statusElement.style.display = 'block';
+      setTimeout(() => { statusElement.style.display = 'none'; }, duration);
+    }
+
+    async function render() {
+      try {
+        const resp = await fetch('/page-data');
+        if (!resp.ok) throw new Error('无法获取页面数据: ' + await resp.text());
+        const data = await resp.json();
+
+        // 统计信息 — 同时放入概览区（手机）和选择栏（桌面）
+        const s = data.stats;
+        if (s) {
+          const statsH = '<b>' + s.total + '</b> 文件 &emsp;|&emsp; <b>' + formatSize(s.totalSize) + '</b> &emsp;|&emsp; <b>' + s.bucketCount + '</b>/<b>' + s.totalDomains + '</b> 桶';
+          document.getElementById('path-breadcrumbs').innerHTML = '📊 ' + statsH;
+          document.getElementById('bar-stats').innerHTML = '📊 ' + statsH;
+        }
+
+        // 渲染选择栏
+        const sb = document.getElementById('selection-bar');
+        if (data.files && data.files.length > 0) {
+          sb.classList.add('show');
+        } else {
+          sb.classList.remove('show');
+        }
+        // 清空已选
+        window.__selectedFiles = new Set();
+        document.getElementById('select-all').checked = false;
+        updateSelectionBar();
+
+        // 渲染文件列表
+        renderFileList(data.files || []);
+        updateUploadButtonState();
+
+        bootstrapped = data.bootstrapped || false;
+      } catch (error) {
+        showStatus('错误: ' + error.message, true);
+      }
+    }
+    
+    function updateUploadButtonState() {
+        document.getElementById('upload-btn').disabled = false;
+        document.getElementById('new-file-btn').disabled = false;
+        document.getElementById('upload-btn').title = '上传文件（自动路由到对应节点）';
+        document.getElementById('new-file-btn').title = '新建文件（自动路由到对应节点）';
+    }
+
+    function formatSize(bytes) {
+      if (!bytes) return '0B';
+      if (bytes > 1048576) return (bytes/1048576).toFixed(1)+'MB';
+      if (bytes > 1024) return (bytes/1024).toFixed(1)+'KB';
+      return bytes+'B';
+    }
+
+    function renderFileList(files) {
+      const fileListEl = document.getElementById('file-list');
+      fileListEl.innerHTML = '';
+
+      if (!files || files.length === 0) {
+        const li = document.createElement('li');
+        li.textContent = '暂无文件，点击"上传文件"开始使用';
+        li.style.justifyContent = 'center';
+        fileListEl.appendChild(li);
+        return;
+      }
+
+      files.sort((a, b) => a.filename.localeCompare(b.filename));
+
+      files.forEach(item => {
+        const li = document.createElement('li');
+        li.dataset.filename = item.filename;
+        li.dataset.node = item.node;
+
+        // 多选框
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'file-checkbox';
+        cb.onchange = function(e) {
+          e.stopPropagation();
+          updateSelection(this, li);
+        };
+        li.appendChild(cb);
+
+        li.innerHTML += icons.file;
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'item-name';
+        nameSpan.textContent = item.filename;
+        nameSpan.title = item.filename;
+        nameSpan.onclick = (e) => {
+          e.stopPropagation();
+          if (isTextFile(item.filename)) {
+            editFile(item.node, item.filename);
+          } else {
+            downloadFile(item.node, item.filename);
+          }
+        };
+        li.appendChild(nameSpan);
+
+        const metaSpan = document.createElement('span');
+        metaSpan.className = 'item-meta';
+        metaSpan.textContent = formatSize(item.size) + ' @ ' + item.node;
+        metaSpan.title = '节点: ' + item.node + ' | 大小: ' + formatSize(item.size);
+        li.appendChild(metaSpan);
+
+        const actions = document.createElement('div');
+        actions.className = 'item-actions';
+        
+        if (isTextFile(item.filename)) {
+          const editBtn = document.createElement('button');
+          editBtn.title = '编辑';
+          editBtn.innerHTML = icons.edit;
+          editBtn.onclick = (e) => { e.stopPropagation(); editFile(item.node, item.filename); };
+          actions.appendChild(editBtn);
+        } else {
+          const blankBtn = document.createElement('button');
+          blankBtn.style.visibility = 'hidden';
+          blankBtn.innerHTML = icons.edit;
+          blankBtn.disabled = true;
+          actions.appendChild(blankBtn);
+        }
+
+        const renameBtn = document.createElement('button');
+        renameBtn.title = '重命名';
+        renameBtn.innerHTML = icons.rename;
+        renameBtn.onclick = (e) => { e.stopPropagation(); renameFile(item.node, item.filename); };
+        actions.appendChild(renameBtn);
+        
+        const downloadBtn = document.createElement('button');
+        downloadBtn.title = '下载';
+        downloadBtn.innerHTML = icons.download;
+        downloadBtn.onclick = (e) => { e.stopPropagation(); downloadFile(item.node, item.filename); };
+        actions.appendChild(downloadBtn);
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.title = '删除';
+        deleteBtn.innerHTML = icons.delete;
+        deleteBtn.onclick = (e) => { e.stopPropagation(); deleteFile(item.node, item.filename); };
+        actions.appendChild(deleteBtn);
+
+        li.appendChild(actions);
+        fileListEl.appendChild(li);
+      });
+    }
+    
+    function isTextFile(filename) {
+      const textExtensions = [
+        'txt', 'js', 'json', 'html', 'css', 'md', 'xml', 'yml', 'yaml', 'csv', 'log', 'sh', 'conf',
+        'py', 'ts', 'tsx', 'mts', 'cts', 'jsx', 'vue', 'svelte', 'astro',
+        'java', 'go', 'rs', 'rb', 'php', 'pl', 'lua',
+        'c', 'cpp', 'cc', 'h', 'hpp', 'cs',
+        'toml', 'ini', 'cfg', 'env', 'sql',
+        'bat', 'ps1', 'bash', 'zsh',
+        'mjs', 'cjs',
+        'swift', 'kt', 'dart', 'tex', 'r', 'dockerfile', 'graphql',
+        'gradle', 'makefile'
+      ];
+      const extension = filename.split('.').pop().toLowerCase();
+      return textExtensions.includes(extension);
+    }
+
+    // 多选功能
+    function updateSelectionBar() {
+      const count = window.__selectedFiles ? window.__selectedFiles.size : 0;
+      const el = document.getElementById('select-count');
+      const btn = document.getElementById('delete-selected-btn');
+      if (el) el.textContent = '已选 ' + count + ' 个';
+      if (btn) btn.disabled = count === 0;
+    }
+
+    function updateSelection(cb, li) {
+      window.__selectedFiles = window.__selectedFiles || new Set();
+      const fn = li.dataset.filename;
+      if (cb.checked) {
+        window.__selectedFiles.add(fn);
+        li.classList.add('selected');
+      } else {
+        window.__selectedFiles.delete(fn);
+        li.classList.remove('selected');
+        document.getElementById('select-all').checked = false;
+      }
+      updateSelectionBar();
+    }
+
+    function toggleSelectAll() {
+      const checked = document.getElementById('select-all').checked;
+      window.__selectedFiles = window.__selectedFiles || new Set();
+      const cbs = document.querySelectorAll('#file-list .file-checkbox');
+      cbs.forEach(cb => {
+        cb.checked = checked;
+        const li = cb.closest('li');
+        const fn = li.dataset.filename;
+        if (checked) { window.__selectedFiles.add(fn); li.classList.add('selected'); }
+        else { window.__selectedFiles.delete(fn); li.classList.remove('selected'); }
+      });
+      updateSelectionBar();
+    }
+
+    async function deleteSelected() {
+      const count = window.__selectedFiles ? window.__selectedFiles.size : 0;
+      if (count === 0) return;
+      if (!confirm('确定删除选中的 ' + count + ' 个文件？此操作无法撤销。')) return;
+      showStatus('正在删除 ' + count + ' 个文件...');
+      let success = 0, fail = 0;
+      const items = document.querySelectorAll('#file-list li.selected');
+      for (const li of items) {
+        const domain = li.dataset.node;
+        const filename = li.dataset.filename;
+        try {
+          const resp = await fetch('/delete/' + encodeURIComponent(filename) + '?node=' + encodeURIComponent(domain), { method: 'DELETE' });
+          if (resp.ok) success++; else fail++;
+        } catch { fail++; }
+      }
+      showStatus('删除完成: ' + success + ' 成功, ' + fail + ' 失败');
+      render();
+    }
+
+    async function handleNewFileConfirm() {
+      const filename = document.getElementById('new-filename').value.trim();
+      if (!filename) { showStatus('请输入文件名', true); return; }
+
+      try {
+        const listRes = await fetch('/list-all');
+        const listData = await listRes.json();
+        if (listData.files && listData.files.some(f => f.filename === filename)) {
+          showStatus('文件 "' + filename + '" 已存在，请使用其他文件名', true);
+          return;
+        }
+      } catch (e) {}
+
+      document.getElementById('new-file-modal').style.display = 'none';
+
+      try {
+        const response = await fetch('/update/' + encodeURIComponent(filename), { 
+          method: 'PUT', body: new Blob([], {type: 'text/plain'})
+        });
+        if (!response.ok) throw new Error(await response.text());
+        showStatus('文件 "' + filename + '" 创建成功');
+        render();
+      } catch (error) {
+        showStatus('创建文件时出错: ' + error.message, true);
+      }
+    }
+    
+    function toggleWrap() {
+      const textarea = document.getElementById('editor-textarea');
+      const btn = document.getElementById('wrap-toggle-btn');
+      textarea.classList.toggle('wrap');
+      btn.textContent = textarea.classList.contains('wrap') ? '不换行' : '换行';
+    }
+
+    function formatJson(beautify) {
+      const textarea = document.getElementById('editor-textarea');
+      try {
+        const jsonObj = JSON.parse(textarea.value);
+        textarea.value = beautify ? JSON.stringify(jsonObj, null, 2) : JSON.stringify(jsonObj);
+        showStatus(beautify ? 'JSON 格式化成功' : 'JSON 压缩成功');
+      } catch (error) {
+        showStatus('错误: 无效的 JSON 内容。 ' + error.message, true);
+      }
+    }
+    
+    async function downloadFile(domain, filePath) {
+      const resp = await fetch('/' + encodeURIComponent(filePath) + '?node=' + encodeURIComponent(domain));
+      if (!resp.ok) { showStatus('下载失败', true); return; }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filePath;
+      a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    async function renameFile(domain, oldName) {
+      const newName = prompt('请输入新文件名：', oldName);
+      if (!newName || newName === oldName) return;
+
+      try {
+        const response = await fetch('/rename/' + encodeURIComponent(oldName) + '?node=' + encodeURIComponent(domain), {
+          method: 'POST',
+          body: JSON.stringify({ newname: newName }),
+          headers: { 'Content-Type': 'application/json' }
+        });
+        if (!response.ok) throw new Error(await response.text());
+        showStatus('已重命名为 "' + newName + '"');
+        render();
+      } catch (error) {
+        showStatus('重命名失败: ' + error.message, true);
+      }
+    }
+
+    async function handleFileUpload(event) {
+      const files = event.target.files;
+      if (files.length === 0) return;
+
+      showStatus('开始上传 ' + files.length + ' 个文件...');
+      for (const file of files) {
+        try {
+          const response = await fetch('/update/' + encodeURIComponent(file.name), { method: 'PUT', body: file });
+          if (!response.ok) throw new Error(await response.text());
+          showStatus('文件 "' + file.name + '" 上传成功!');
+        } catch (error) {
+          showStatus('上传 "' + file.name + '" 时出错: ' + error.message, true);
+        }
+      }
+      event.target.value = '';
+      render();
+    }
+
+    async function deleteFile(domain, filePath) {
+      if (!confirm('确定要删除文件 "' + filePath + '" 吗？此操作无法撤销。')) return;
+
+      try {
+        const response = await fetch('/delete/' + encodeURIComponent(filePath) + '?node=' + encodeURIComponent(domain), { method: 'DELETE' });
+        if (!response.ok) throw new Error(await response.text());
+        showStatus('文件 "' + filePath + '" 已删除。');
+        render();
+      } catch (error) {
+        showStatus('删除文件时出错: ' + error.message, true);
+      }
+    }
+
+    async function handleSaveEditor() {
+      const { domain, filePath } = currentFileForOperation;
+      const content = document.getElementById('editor-textarea').value;
+      
+      try {
+        const response = await fetch('/update/' + encodeURIComponent(filePath) + '?node=' + encodeURIComponent(domain), {
+          method: 'PUT', body: content, headers: { 'Content-Type': 'text/plain' }
+        });
+        if (!response.ok) throw new Error(await response.text());
+        document.getElementById('editor-modal').style.display = 'none';
+        showStatus('文件保存成功');
+        render();
+      } catch (error) {
+        showStatus('保存文件时出错: ' + error.message, true);
+      }
+    }
+
+    async function editFile(domain, filePath) {
+      try {
+        const response = await fetch('/' + encodeURIComponent(filePath) + '?node=' + encodeURIComponent(domain));
+        if (!response.ok) throw new Error('无法下载文件');
+        const content = await response.text();
+        document.getElementById('editor-filename').textContent = filePath;
+        document.getElementById('editor-textarea').value = content;
+        currentFileForOperation = { domain, filePath };
+        document.getElementById('editor-modal').style.display = 'block';
+      } catch (error) {
+        showStatus('打开文件编辑器时出错: ' + error.message, true);
+      }
+    }
+  </script>
+</body>
+</html>
 `;
 
-// --- 登录/设置页面（纯字符串拼接，无模板字符串嵌套）---
-var LP = '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>KV 文件管理器 - 登录</title><style>' +
-'body{display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0;background:#f0f2f5;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}' +
-'.box{background:#fff;padding:40px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);width:100%;max-width:360px}' +
-'.box h2{text-align:center;margin-bottom:24px;color:#333}' +
-'.box input{width:100%;padding:12px;margin-bottom:16px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;font-size:14px}' +
-'.box button{width:100%;padding:12px;background:#007bff;color:#fff;border:none;border-radius:4px;font-size:16px;cursor:pointer}' +
-'.box button:hover{background:#0056b3}' +
-'.box .err{color:#dc3545;margin-top:12px;text-align:center;display:none}' +
-'.loading{text-align:center;color:#888;padding:20px}' +
-'</style></head><body><div class="box" id="loginBox">' +
-'<h2 id="title">加载中...</h2>' +
-'<div id="loadingMsg" class="loading">正在检查登录状态...</div>' +
-'<input type="text" id="user" placeholder="用户名" style="display:none">' +
-'<input type="password" id="pass" placeholder="密码" style="display:none">' +
-'<input type="password" id="pass2" placeholder="确认密码" style="display:none">' +
-'<button type="button" id="loginBtn" style="display:none">登录</button>' +
-'<div class="err" id="errMsg"></div>' +
-'</div><script>' +
-'var $=function(id){return document.getElementById(id);};' +
-'var show=function(id,v){$(id).style.display=v?"block":"none";};' +
-'function doLogin(){' +
-'  var u=$("user").value.trim(),p=$("pass").value,p2=$("pass2").value;' +
-'  if(!u||!p){$("errMsg").textContent="请输入用户名和密码";show("errMsg",true);return;}' +
-'  var auth=btoa(u+":"+p);' +
-'  var setup=$("loginBtn").dataset.mode=="setup";' +
-'  if(setup){' +
-'    if(p!==p2){$("errMsg").textContent="两次密码不一致";show("errMsg",true);return;}' +
-'    fetch("/auth/credentials",{method:"PUT",headers:{"Content-Type":"application/json","Authorization":"Basic "+auth},body:JSON.stringify({username:u,password:p})}).then(function(r){' +
-'      if(r.ok){sessionStorage.setItem("auth",auth);window.location.href="/files";}' +
-'      else{$("errMsg").textContent="设置失败";show("errMsg",true);}' +
-'    });' +
-'  }else{' +
-'    fetch("/auth/check",{headers:{"Authorization":"Basic "+auth}}).then(function(r){return r.json();}).then(function(d){' +
-'      if(d.authenticated){sessionStorage.setItem("auth",auth);window.location.href="/files";}' +
-'      else{$("errMsg").textContent="用户名或密码错误";show("errMsg",true);}' +
-'    });' +
-'  }' +
-'}' +
-'$("loginBtn").onclick=doLogin;' +
-'var keyHandler=function(e){if(e.key=="Enter")doLogin();};' +
-'$("user").addEventListener("keydown",keyHandler);' +
-'$("pass").addEventListener("keydown",keyHandler);' +
-'$("pass2").addEventListener("keydown",keyHandler);' +
-'fetch("/auth/check").then(function(r){return r.json();}).then(function(d){' +
-'  show("loadingMsg",false);' +
-'  if(d.needSetup){' +
-'    $("title").textContent="初始化管理员账号";' +
-'    $("loginBtn").textContent="创建账号";' +
-'    $("loginBtn").dataset.mode="setup";' +
-'    show("user",true);show("pass",true);show("pass2",true);show("loginBtn",true);' +
-'    $("errMsg").textContent="首次使用，请设置管理员用户名和密码";show("errMsg",true);' +
-'  }else{' +
-'    $("title").textContent="文件管理器登录";' +
-'    $("loginBtn").textContent="登 录";' +
-'    $("loginBtn").dataset.mode="login";' +
-'    show("user",true);show("pass",true);show("loginBtn",true);' +
-'  }' +
-'}).catch(function(){' +
-'  show("loadingMsg",false);' +
-'  $("title").textContent="初始化管理员账号";' +
-'  $("loginBtn").textContent="创建账号";' +
-'  $("loginBtn").dataset.mode="setup";' +
-'  show("user",true);show("pass",true);show("pass2",true);show("loginBtn",true);' +
-'  $("errMsg").textContent="首次使用，请设置管理员用户名和密码";show("errMsg",true);' +
-'});</scr' + 'ipt></body></html>';
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname.substring(1);
 
+    const { MY_SCRIPT_BUCKET } = env;
 
+    const authHeader = request.headers.get('Authorization');
+    const basicValid = await checkCredentials(authHeader, env, MY_SCRIPT_BUCKET);
+    const tokenInfo = !basicValid ? await checkToken(request, env, MY_SCRIPT_BUCKET) : null;
+    const isAdmin = basicValid;
+    const hasCredentials = !!(await loadKVCredentials(MY_SCRIPT_BUCKET));
 
-export default { 
-    async fetch(request, env, ctx) { 
-        const url = new URL(request.url); 
-        const path = url.pathname.substring(1); 
-        const { MY_SCRIPT_BUCKET } = env; 
-        const authHeader = request.headers.get('Authorization'); 
-        const kvCreds = await loadKVCredentials(MY_SCRIPT_BUCKET); 
-        const isFirstRun = !kvCreds && !(env.JIANGUO_USERNAME && env.JIANGUO_PASSWORD); 
-        const basicValid = await checkCredentials(authHeader, env, MY_SCRIPT_BUCKET, kvCreds); 
-        const tokenInfo = !basicValid ? await checkToken(request, env, MY_SCRIPT_BUCKET) : null; 
-        const isAdmin = basicValid; 
+    // 无凭据时跳过认证检查（允许空账号直接使用）
+    if (hasCredentials && path !== '' && path !== 'auth/status' && path !== 'auth/setup' && (isFileOperation(path, request.method) ? !isAdmin && !tokenInfo : !isAdmin)) {
+      return new Response('未授权访问。\n', { status: 401 });
+    }
 
-        // 认证状态检查始终可访问，用于前端判断是否需要初始化
-        if (request.method === 'GET' && path === 'auth/check') { 
-            return new Response(JSON.stringify({ authenticated: isAdmin || !!tokenInfo, isAdmin, needSetup: isFirstRun }), { headers: { 'Content-Type': 'application/json' } }); 
-        } 
+    let requestAuthHeader = '';
+    if (isAdmin) {
+      requestAuthHeader = authHeader;
+    } else if (hasCredentials) {
+      const creds = await loadKVCredentials(MY_SCRIPT_BUCKET);
+      if (creds) requestAuthHeader = getAuthHeader(creds.username, creds.password);
+    }
+    const currentDomain = url.hostname;
+    const allDomains = await getAllDomains(env, currentDomain, MY_SCRIPT_BUCKET);
 
-        // 首次设置管理员账号无需认证
-        if (isFirstRun && request.method === 'PUT' && path === 'auth/credentials') { 
-            const body = JSON.parse(await request.text() || '{}'); 
-            if (!body.username || !body.password) return new Response('需要用户名和密码。\n', { status: 400 }); 
-            const creds = { username: body.username, password: body.password }; 
-            await MY_SCRIPT_BUCKET.put('__settings__/credentials', JSON.stringify(creds)); 
-            const allDomains = await getAllDomains(env, url.hostname, MY_SCRIPT_BUCKET); 
-            await syncSettingsToAll('credentials', creds, allDomains, url.hostname, getAuthHeader(body.username, body.password)); 
-            return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } }); 
-        } 
+    // --- 代理路由 ---
+    if (path.startsWith('proxy/')) {
+      const parts = path.split('/');
+      const targetDomain = parts[1];
+      const targetPath = parts.slice(2).join('/');
+      if (!targetDomain || !targetPath) {
+        return new Response('代理请求格式错误。\n', { status: 400 });
+      }
+      return proxyRequest(targetDomain, targetPath, request, requestAuthHeader, url);
+    }
 
-        // 文件管理器页面（无需认证，页面内的 API 调用需要认证）
-        if (path === 'files') { 
-            return new Response(fileManagerHtml, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } }); 
-        } 
+    // --- GET /__info__ 返回当前域名自己的信息文件 ---
+    if (request.method === 'GET' && path === '__info__') {
+      const info = await loadInfo(MY_SCRIPT_BUCKET, currentDomain);
+      return new Response(JSON.stringify(info), {
+        headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+      });
+    }
 
-        if (path !== '' && (isFileOperation(path, request.method) ? !isAdmin && !tokenInfo : !isAdmin)) { 
-            return new Response('未授权访问。\n', { status: 401 }); 
-        } 
+    // --- PUT /__info__/<domain> 接收其他域名同步的信息文件（按时间戳更新）---
+    if (request.method === 'PUT' && path.startsWith('__info__/')) {
+      const domain = path.substring('__info__/'.length);
+      if (!domain) return new Response('错误：未指定域名。\n', { status: 400 });
+      const body = await request.text();
+      let remoteInfo;
+      try { remoteInfo = JSON.parse(body); } catch (e) {
+        return new Response('错误：无效的 JSON。\n', { status: 400 });
+      }
+      const localInfo = await loadInfo(MY_SCRIPT_BUCKET, domain);
+      if (remoteInfo.updated_at > localInfo.updated_at) {
+        await MY_SCRIPT_BUCKET.put(getInfoKey(domain), body);
+      }
+      return new Response('ok\n', { status: 200 });
+    }
 
-        const requestAuthHeader = isAdmin ? authHeader : getAuthHeader( 
-            (await loadKVCredentials(MY_SCRIPT_BUCKET) || { username: env.JIANGUO_USERNAME, password: env.JIANGUO_PASSWORD }).username, 
-            (await loadKVCredentials(MY_SCRIPT_BUCKET) || { username: env.JIANGUO_USERNAME, password: env.JIANGUO_PASSWORD }).password 
-        ); 
+    // --- API 路由 ---
+    // 上传/更新
+    if (request.method === 'PUT' && path.startsWith('update/')) {
+      const filename = decodeURIComponent(path.substring('update/'.length));
+      if (!filename) return new Response('错误：未指定文件名。\n', { status: 400 });
+      if (!isSafePath(filename)) return new Response('错误：文件名不合法（禁止路径遍历）。\n', { status: 400 });
+      if (!isAdmin && tokenInfo && !tokenInfo.permissions.upload) return new Response('无上传权限。\n', { status: 403 });
 
-        const currentDomain = url.hostname; 
-        const allDomains = await getAllDomains(env, currentDomain, MY_SCRIPT_BUCKET); 
+      const nodeParam = url.searchParams.get('node');
+      let targetDomain;
+      if (nodeParam) {
+        targetDomain = allDomains.includes(nodeParam) ? nodeParam : allDomains[parseInt(nodeParam)];
+      } else {
+        // 跨节点查找文件位置
+        targetDomain = await findFileNodeFromInfo(MY_SCRIPT_BUCKET, filename, allDomains, null);
+        if (!targetDomain) {
+          targetDomain = await findLightestNode(MY_SCRIPT_BUCKET, allDomains);
+        }
+      }
 
-        // --- 代理路由 --- 
-        if (path.startsWith('proxy/')) { 
-            const parts = path.split('/'); 
-            const targetDomain = parts[1]; 
-            const targetPath = parts.slice(2).join('/'); 
-            if (!targetDomain || !targetPath) { 
-                return new Response('代理请求格式错误。\n', { status: 400 }); 
-            } 
-            return proxyRequest(targetDomain, targetPath, request, requestAuthHeader, url); 
-        } 
+      const bodyText = await request.text();
 
-        // --- GET /__info__ 返回当前域名自己的信息文件 --- 
-        if (request.method === 'GET' && path === '__info__') { 
-            const info = await loadInfo(MY_SCRIPT_BUCKET, currentDomain); 
-            return new Response(JSON.stringify(info), { headers: { 'Content-Type': 'application/json;charset=UTF-8' } }); 
-        } 
+      if (targetDomain !== currentDomain) {
+        return proxyRequest(targetDomain, path, request, requestAuthHeader, url, bodyText);
+      }
 
-        // --- PUT /__info__/<domain> 接收其他域名同步的信息文件（按时间戳更新）--- 
-        if (request.method === 'PUT' && path.startsWith('__info__/')) { 
-            const domain = path.substring('__info__/'.length); 
-            if (!domain) return new Response('错误：未指定域名。\n', { status: 400 }); 
-            const body = await request.text(); 
-            let remoteInfo; 
-            try { 
-                remoteInfo = JSON.parse(body); 
-            } catch (e) { 
-                return new Response('错误：无效的 JSON。\n', { status: 400 }); 
-            } 
-            const localInfo = await loadInfo(MY_SCRIPT_BUCKET, domain); 
-            if (remoteInfo.updated_at > localInfo.updated_at) { 
-                await MY_SCRIPT_BUCKET.put(getInfoKey(domain), body); 
-            } 
-            return new Response('ok\n', { status: 200 }); 
-        } 
+      const contentType = request.headers.get('Content-Type') || guessContentType(filename);
+      const fileSize = bodyText.length;
 
-        // --- API 路由 --- 
-        // 上传/更新 
-        if (request.method === 'PUT' && path.startsWith('update/')) { 
-            const filename = decodeURIComponent(path.substring('update/'.length)); 
-            if (!filename) return new Response('错误：未指定文件名。\n', { status: 400 }); 
-            if (!isSafePath(filename)) return new Response('错误：文件名不合法（禁止路径遍历）。\n', { status: 400 }); 
-            if (!isAdmin && tokenInfo && !tokenInfo.permissions.upload) return new Response('无上传权限。\n', { status: 403 }); 
+      await MY_SCRIPT_BUCKET.put(filename, bodyText);
 
-            const nodeParam = url.searchParams.get('node'); 
-            let targetDomain; 
-            if (nodeParam) { 
-                targetDomain = allDomains.includes(nodeParam) ? nodeParam : allDomains[parseInt(nodeParam)]; 
-            } else { 
-                // 跨节点查找文件位置 
-                targetDomain = await findFileNodeFromInfo(MY_SCRIPT_BUCKET, filename, allDomains, null); 
-                if (!targetDomain) { 
-                    targetDomain = await findLightestNode(MY_SCRIPT_BUCKET, allDomains); 
-                } 
-            } 
+      // 更新本地信息文件
+      const info = await addFileToInfo(MY_SCRIPT_BUCKET, currentDomain, filename, fileSize, contentType);
 
-            if (targetDomain !== currentDomain) { 
-                return proxyRequest(targetDomain, path, request, requestAuthHeader, url); 
-            } 
+      // 同步信息文件到所有其他节点
+      const infoBody = JSON.stringify(info);
+      await Promise.allSettled(
+        allDomains.filter(d => d !== currentDomain).map(d =>
+          fetch(`https://${d}/__info__/${currentDomain}`, {
+            method: 'PUT', body: infoBody,
+            headers: { 'Authorization': requestAuthHeader, 'Content-Type': 'application/json' }
+          }).catch(() => {})
+        )
+      );
 
-            const bodyBuffer = await request.arrayBuffer(); // 修复：改用 arrayBuffer 防止二进制损坏
-            const contentType = request.headers.get('Content-Type') || guessContentType(filename); 
-            const fileSize = bodyBuffer.byteLength; // 修复：获取实际字节长度
-            await MY_SCRIPT_BUCKET.put(filename, bodyBuffer); 
+      return new Response(JSON.stringify({ success: true, filename, size: fileSize, node: currentDomain }), {
+        headers: { 'Content-Type': 'application/json' }, status: 200
+      });
+    }
 
-            // 更新本地信息文件 
-            const info = await addFileToInfo(MY_SCRIPT_BUCKET, currentDomain, filename, fileSize, contentType); 
-            // 同步信息文件到所有其他节点 
-            const infoBody = JSON.stringify(info); 
-            await Promise.allSettled( 
-                allDomains.filter(d => d !== currentDomain).map(d => fetch(`https://${d}/__info__/${currentDomain}`, { 
-                    method: 'PUT', 
-                    body: infoBody, 
-                    headers: { 'Authorization': requestAuthHeader, 'Content-Type': 'application/json' } 
-                }).catch(() => {})) 
-            ); 
+    // 删除
+    if (request.method === 'DELETE' && path.startsWith('delete/')) {
+      const filename = decodeURIComponent(path.substring('delete/'.length));
+      if (!filename) return new Response('错误：未指定文件名。\n', { status: 400 });
+      if (!isSafePath(filename)) return new Response('错误：文件名不合法（禁止路径遍历）。\n', { status: 400 });
+      if (!isAdmin && tokenInfo && !tokenInfo.permissions.delete) return new Response('无删除权限。\n', { status: 403 });
 
-            return new Response(JSON.stringify({ success: true, filename, size: fileSize, node: currentDomain }), { 
-                headers: { 'Content-Type': 'application/json' }, 
-                status: 200 
-            }); 
-        } 
+      const nodeParam = url.searchParams.get('node');
+      const targetDomain = resolveNode(filename, allDomains, nodeParam);
 
-        // 删除 
-        if (request.method === 'DELETE' && path.startsWith('delete/')) { 
-            const filename = decodeURIComponent(path.substring('delete/'.length)); 
-            if (!filename) return new Response('错误：未指定文件名。\n', { status: 400 }); 
-            if (!isSafePath(filename)) return new Response('错误：文件名不合法（禁止路径遍历）。\n', { status: 400 }); 
-            if (!isAdmin && tokenInfo && !tokenInfo.permissions.delete) return new Response('无删除权限。\n', { status: 403 }); 
+      if (targetDomain !== currentDomain) {
+        return proxyRequest(targetDomain, path, request, requestAuthHeader, url);
+      }
 
-            const nodeParam = url.searchParams.get('node'); 
-            const targetDomain = resolveNode(filename, allDomains, nodeParam); 
-            if (targetDomain !== currentDomain) { 
-                return proxyRequest(targetDomain, path, request, requestAuthHeader, url); 
-            } 
+      await MY_SCRIPT_BUCKET.delete(filename);
 
-            await MY_SCRIPT_BUCKET.delete(filename); 
+      // 更新本地信息文件
+      const info = await removeFileFromInfo(MY_SCRIPT_BUCKET, currentDomain, filename);
 
-            // 更新本地信息文件 
-            const info = await removeFileFromInfo(MY_SCRIPT_BUCKET, currentDomain, filename); 
-            // 同步信息文件到所有其他节点 
-            const infoBody = JSON.stringify(info); 
-            await Promise.allSettled( 
-                allDomains.filter(d => d !== currentDomain).map(d => fetch(`https://${d}/__info__/${currentDomain}`, { 
-                    method: 'PUT', 
-                    body: infoBody, 
-                    headers: { 'Authorization': requestAuthHeader, 'Content-Type': 'application/json' } 
-                }).catch(() => {})) 
-            ); 
+      // 同步信息文件到所有其他节点
+      const infoBody = JSON.stringify(info);
+      await Promise.allSettled(
+        allDomains.filter(d => d !== currentDomain).map(d =>
+          fetch(`https://${d}/__info__/${currentDomain}`, {
+            method: 'PUT', body: infoBody,
+            headers: { 'Authorization': requestAuthHeader, 'Content-Type': 'application/json' }
+          }).catch(() => {})
+        )
+      );
 
-            return new Response(JSON.stringify({ success: true, filename, node: currentDomain }), { 
-                headers: { 'Content-Type': 'application/json' }, 
-                status: 200 
-            }); 
-        } 
+      return new Response(JSON.stringify({ success: true, filename, node: currentDomain }), {
+        headers: { 'Content-Type': 'application/json' }, status: 200
+      });
+    }
 
-        // 重命名 
-        if (request.method === 'POST' && path.startsWith('rename/')) { 
-            const oldName = decodeURIComponent(path.substring('rename/'.length)); 
-            if (!oldName) return new Response('错误：未指定文件名。\n', { status: 400 }); 
-            if (!isSafePath(oldName)) return new Response('错误：文件名不合法。\n', { status: 400 }); 
-            if (!isAdmin && tokenInfo && !tokenInfo.permissions.delete) return new Response('无删除权限。\n', { status: 403 }); 
+    // 重命名
+    if (request.method === 'POST' && path.startsWith('rename/')) {
+      const oldName = decodeURIComponent(path.substring('rename/'.length));
+      if (!oldName) return new Response('错误：未指定文件名。\n', { status: 400 });
+      if (!isSafePath(oldName)) return new Response('错误：文件名不合法。\n', { status: 400 });
+      if (!isAdmin && tokenInfo && !tokenInfo.permissions.delete) return new Response('无删除权限。\n', { status: 403 });
 
-            const bodyText = await request.text(); 
-            let newName; 
-            try { 
-                newName = JSON.parse(bodyText).newname; 
-            } catch (e) { 
-                return new Response('错误：请求体需要 JSON {newname: "..."}\n', { status: 400 }); 
-            } 
-            if (!newName || !isSafePath(newName)) { 
-                return new Response('错误：新文件名不合法。\n', { status: 400 }); 
-            } 
+      const bodyText = await request.text();
+      let newName;
+      try {
+        newName = JSON.parse(bodyText).newname;
+      } catch (e) {
+        return new Response('错误：请求体需要 JSON {newname: "..."}\n', { status: 400 });
+      }
+      if (!newName || !isSafePath(newName)) {
+        return new Response('错误：新文件名不合法。\n', { status: 400 });
+      }
 
-            const nodeParam = url.searchParams.get('node'); 
-            const targetDomain = resolveNode(oldName, allDomains, nodeParam); 
-            if (targetDomain !== currentDomain) { 
-                const targetUrl = `https://${targetDomain}/rename/${oldName}${url.search}`; 
-                try { 
-                    const resp = await fetch(targetUrl, { 
-                        method: 'POST', 
-                        body: bodyText, 
-                        headers: { 'Authorization': requestAuthHeader, 'Content-Type': 'application/json' } 
-                    }); 
-                    return new Response(resp.body, resp); 
-                } catch (e) { 
-                    return new Response(`代理请求失败: ${e.message}\n`, { status: 500 }); 
-                } 
-            } 
+      const nodeParam = url.searchParams.get('node');
+      const targetDomain = resolveNode(oldName, allDomains, nodeParam);
 
-            if (!newName || !isSafePath(newName)) { 
-                return new Response('错误：新文件名不合法。\n', { status: 400 }); 
-            } 
+      if (targetDomain !== currentDomain) {
+        const targetUrl = `https://${targetDomain}/rename/${oldName}${url.search}`;
+        try {
+          const resp = await fetch(targetUrl, {
+            method: 'POST', body: bodyText,
+            headers: { 'Authorization': requestAuthHeader, 'Content-Type': 'application/json' }
+          });
+          return new Response(resp.body, resp);
+        } catch (e) {
+          return new Response(`代理请求失败: ${e.message}\n`, { status: 500 });
+        }
+      }
+      if (!newName || !isSafePath(newName)) {
+        return new Response('错误：新文件名不合法。\n', { status: 400 });
+      }
 
-            const content = await MY_SCRIPT_BUCKET.get(oldName, { type: 'arrayBuffer' }); // 修复：改用 arrayBuffer
-            if (content === null) { 
-                return new Response(`未找到文件: ${oldName}\n`, { status: 404 }); 
-            } 
-            await MY_SCRIPT_BUCKET.put(newName, content); 
-            await MY_SCRIPT_BUCKET.delete(oldName); 
+      const content = await MY_SCRIPT_BUCKET.get(oldName, { type: 'text' });
+      if (content === null) {
+        return new Response(`未找到文件: ${oldName}\n`, { status: 404 });
+      }
 
-            const info = await loadInfo(MY_SCRIPT_BUCKET, currentDomain); 
-            const oldEntry = info.files[oldName]; 
-            if (oldEntry) { 
-                delete info.files[oldName]; 
-                info.files[newName] = oldEntry; 
-            } 
-            await saveInfo(MY_SCRIPT_BUCKET, currentDomain, info); 
+      await MY_SCRIPT_BUCKET.put(newName, content);
+      await MY_SCRIPT_BUCKET.delete(oldName);
 
-            const infoBody = JSON.stringify(info); 
-            await Promise.allSettled( 
-                allDomains.filter(d => d !== currentDomain).map(d => fetch(`https://${d}/__info__/${currentDomain}`, { 
-                    method: 'PUT', 
-                    body: infoBody, 
-                    headers: { 'Authorization': requestAuthHeader, 'Content-Type': 'application/json' } 
-                }).catch(() => {})) 
-            ); 
+      const info = await loadInfo(MY_SCRIPT_BUCKET, currentDomain);
+      const oldEntry = info.files[oldName];
+      if (oldEntry) {
+        delete info.files[oldName];
+        info.files[newName] = oldEntry;
+      }
+      await saveInfo(MY_SCRIPT_BUCKET, currentDomain, info);
 
-            return new Response(JSON.stringify({ success: true, old_name: oldName, new_name: newName }), { 
-                headers: { 'Content-Type': 'application/json' }, 
-                status: 200 
-            }); 
-        } 
+      const infoBody = JSON.stringify(info);
+      await Promise.allSettled(
+        allDomains.filter(d => d !== currentDomain).map(d =>
+          fetch(`https://${d}/__info__/${currentDomain}`, {
+            method: 'PUT', body: infoBody,
+            headers: { 'Authorization': requestAuthHeader, 'Content-Type': 'application/json' }
+          }).catch(() => {})
+        )
+      );
 
-        // 返回本地节点统计（内部端点） 
-        if (request.method === 'GET' && path === 'node-stats') { 
-            if (!isAdmin && tokenInfo && !tokenInfo.permissions.download) return new Response('无下载权限。\n', { status: 403 }); 
-            const info = await loadInfo(MY_SCRIPT_BUCKET, currentDomain); 
-            let totalSize = 0; 
-            const fileList = []; 
-            for (const [filename, f] of Object.entries(info.files)) { 
-                totalSize += f.size || 0; 
-                fileList.push({ filename, size: f.size, content_type: f.content_type }); 
-            } 
-            return new Response(JSON.stringify({ domain: currentDomain, fileCount: fileList.length, totalSize, files: fileList }), { headers: { 'Content-Type': 'application/json;charset=UTF-8' } }); 
-        } 
+      return new Response(JSON.stringify({ success: true, old_name: oldName, new_name: newName }), {
+        headers: { 'Content-Type': 'application/json' }, status: 200
+      });
+    }
 
-        // 列出所有键（仅文件内容，不含 __info__） 
-        if (request.method === 'GET' && path === 'list-keys') { 
-            const localList = await MY_SCRIPT_BUCKET.list(); 
-            const localKeys = localList.keys.filter(k => !k.name.startsWith('__info__/')).map(k => k.name); 
-            const allFilesByDomain = { [currentDomain]: localKeys }; 
-            const results = await Promise.allSettled( 
-                allDomains.filter(d => d !== currentDomain).map(domain => fetch(`https://${domain}/list-keys-flat`, { headers: { 'Authorization': requestAuthHeader } }) 
-                .then(res => res.ok ? res.json() : Promise.reject()) 
-                .then(data => ({ domain, keys: data.keys })) 
-                .catch(() => ({ domain, keys: [] }))) 
-            ); 
-            results.forEach(r => { 
-                if (r.status === 'fulfilled') allFilesByDomain[r.value.domain] = r.value.keys; 
-            }); 
-            return new Response(JSON.stringify(allFilesByDomain), { headers: { 'Content-Type': 'application/json;charset=UTF-8' } }); 
-        } 
+    // 返回本地节点统计（内部端点）
+    if (request.method === 'GET' && path === 'node-stats') {
+      if (!isAdmin && tokenInfo && !tokenInfo.permissions.download) return new Response('无下载权限。\n', { status: 403 });
+      const info = await loadInfo(MY_SCRIPT_BUCKET, currentDomain);
+      let totalSize = 0;
+      const fileList = [];
+      for (const [filename, f] of Object.entries(info.files)) {
+        totalSize += f.size || 0;
+        fileList.push({ filename, size: f.size, content_type: f.content_type });
+      }
+      return new Response(JSON.stringify({ domain: currentDomain, fileCount: fileList.length, totalSize, files: fileList }), {
+        headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+      });
+    }
 
-        // 只返回本地文件键（不含 __info__） 
-        if (request.method === 'GET' && path === 'list-keys-flat') { 
-            const localList = await MY_SCRIPT_BUCKET.list(); 
-            const localKeys = localList.keys.filter(k => !k.name.startsWith('__info__/')).map(k => k.name); 
-            return new Response(JSON.stringify({ keys: localKeys }), { headers: { 'Content-Type': 'application/json;charset=UTF-8' } }); 
-        } 
+    // 列出所有键（仅文件内容，不含 __info__）
+    if (request.method === 'GET' && path === 'list-keys') {
+      const localList = await MY_SCRIPT_BUCKET.list();
+      const localKeys = localList.keys.filter(k => !k.name.startsWith('__info__/')).map(k => k.name);
+      const allFilesByDomain = { [currentDomain]: localKeys };
 
-        // 统一文件列表（从所有 domain 的信息文件读取） 
-        if (request.method === 'GET' && path === 'list-all') { 
-            if (!isAdmin && tokenInfo && !tokenInfo.permissions.download) return new Response('无下载权限。\n', { status: 403 }); 
-            const files = await getAllFilesFromInfo(MY_SCRIPT_BUCKET, allDomains); 
-            return new Response(JSON.stringify({ files }), { headers: { 'Content-Type': 'application/json;charset=UTF-8' } }); 
-        } 
+      const results = await Promise.allSettled(
+        allDomains.filter(d => d !== currentDomain).map(domain => 
+          fetch(`https://${domain}/list-keys-flat`, { headers: { 'Authorization': requestAuthHeader } })
+            .then(res => res.ok ? res.json() : Promise.reject())
+            .then(data => ({ domain, keys: data.keys }))
+            .catch(() => ({ domain, keys: [] }))
+        )
+      );
+      results.forEach(r => { if (r.status === 'fulfilled') allFilesByDomain[r.value.domain] = r.value.keys; });
 
-        // 节点统计（从所有 domain 的信息文件读取） 
-        if (request.method === 'GET' && path === 'stats') { 
-            if (!isAdmin && tokenInfo && !tokenInfo.permissions.download) return new Response('无下载权限。\n', { status: 403 }); 
-            let totalSize = 0; 
-            let totalFiles = 0; 
-            const nodeMap = {}; 
-            for (const domain of allDomains) { 
-                const info = await loadInfo(MY_SCRIPT_BUCKET, domain); 
-                const fileCount = Object.keys(info.files).length; 
-                if (fileCount > 0) { 
-                    let domainSize = 0; 
-                    for (const f of Object.values(info.files)) domainSize += f.size || 0; 
-                    nodeMap[domain] = { fileCount, totalSize: domainSize }; 
-                    totalSize += domainSize; 
-                    totalFiles += fileCount; 
-                } 
-            } 
-            const nodes = Object.entries(nodeMap).map(([domain, data]) => ({ domain, ...data })); 
-            return new Response(JSON.stringify({ nodes, total: totalFiles, totalSize, bucketCount: nodes.length, totalDomains: allDomains.length }), { headers: { 'Content-Type': 'application/json;charset=UTF-8' } }); 
-        } 
+      return new Response(JSON.stringify(allFilesByDomain), {
+        headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+      });
+    }
+    
+    // 只返回本地文件键（不含 __info__）
+    if (request.method === 'GET' && path === 'list-keys-flat') {
+        const localList = await MY_SCRIPT_BUCKET.list();
+        const localKeys = localList.keys.filter(k => !k.name.startsWith('__info__/')).map(k => k.name);
+        return new Response(JSON.stringify({ keys: localKeys }), {
+            headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+        });
+    }
 
-        // 全量同步：按时间戳拉取所有节点的信息文件 
-        if (request.method === 'GET' && path === 'sync-all') { 
-            let updated = 0, skipped = 0, failed = 0; 
-            const results = await Promise.allSettled( 
-                allDomains.filter(d => d !== currentDomain).map(async (domain) => { 
-                    try { 
-                        const resp = await fetch(`https://${domain}/__info__`, { headers: { 'Authorization': requestAuthHeader } }); 
-                        if (!resp.ok) { 
-                            failed++; 
-                            return; 
-                        } 
-                        const remoteInfo = await resp.json(); 
-                        const localInfo = await loadInfo(MY_SCRIPT_BUCKET, domain); 
-                        if (remoteInfo.updated_at > localInfo.updated_at) { 
-                            await MY_SCRIPT_BUCKET.put(getInfoKey(domain), JSON.stringify(remoteInfo)); 
-                            updated++; 
-                        } else { 
-                            skipped++; 
-                        } 
-                    } catch (e) { 
-                        failed++; 
-                    } 
-                }) 
-            ); 
-            return new Response(JSON.stringify({ updated, skipped, failed, total: allDomains.length }), { headers: { 'Content-Type': 'application/json;charset=UTF-8' } }); 
-        } 
+    // 统一文件列表（从所有 domain 的信息文件读取）
+    if (request.method === 'GET' && path === 'list-all') {
+      if (!isAdmin && tokenInfo && !tokenInfo.permissions.download) return new Response('无下载权限。\n', { status: 403 });
+      const files = await getAllFilesFromInfo(MY_SCRIPT_BUCKET, allDomains);
+      return new Response(JSON.stringify({ files }), {
+        headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+      });
+    }
 
-        // 保留向后兼容：list-meta 从信息文件读取 
-        if (request.method === 'GET' && path === 'list-meta') { 
-            if (!isAdmin && tokenInfo && !tokenInfo.permissions.download) return new Response('无下载权限。\n', { status: 403 }); 
-            const files = await getAllFilesFromInfo(MY_SCRIPT_BUCKET, allDomains); 
-            return new Response(JSON.stringify({ files }), { headers: { 'Content-Type': 'application/json;charset=UTF-8' } }); 
-        } 
+    // 节点统计（从所有 domain 的信息文件读取）
+    if (request.method === 'GET' && path === 'stats') {
+      if (!isAdmin && tokenInfo && !tokenInfo.permissions.download) return new Response('无下载权限。\n', { status: 403 });
+      const allInfos = await Promise.all(allDomains.map(d => loadInfo(MY_SCRIPT_BUCKET, d)));
+      let totalSize = 0;
+      let totalFiles = 0;
+      const nodeMap = {};
+      for (let i = 0; i < allDomains.length; i++) {
+        const domain = allDomains[i];
+        const info = allInfos[i];
+        const fileCount = Object.keys(info.files).length;
+        if (fileCount > 0) {
+          let domainSize = 0;
+          for (const f of Object.values(info.files)) domainSize += f.size || 0;
+          nodeMap[domain] = { fileCount, totalSize: domainSize };
+          totalSize += domainSize;
+          totalFiles += fileCount;
+        }
+      }
+      const nodes = Object.entries(nodeMap).map(([domain, data]) => ({ domain, ...data }));
+      return new Response(JSON.stringify({
+        nodes, total: totalFiles, totalSize,
+        bucketCount: nodes.length, totalDomains: allDomains.length
+      }), {
+        headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+      });
+    }
 
-        // --- 设置管理端点（仅管理员 Basic Auth）---
-        if (!isAdmin && (path.startsWith('auth/') || path.startsWith('domains') || path.startsWith('tokens') || path.startsWith('sync/'))) {
-            return new Response('未授权访问。\n', { status: 401 });
-        } 
+    // 统一页面数据：合并文件列表 + 统计 + 域名（一个请求替代三个）
+    if (request.method === 'GET' && path === 'page-data') {
+      if (!isAdmin && tokenInfo && !tokenInfo.permissions.download) return new Response('无下载权限。\n', { status: 403 });
+      const [files, allInfos, kvVal, firstNodeVal] = await Promise.all([
+        getAllFilesFromInfo(MY_SCRIPT_BUCKET, allDomains),
+        Promise.all(allDomains.map(d => loadInfo(MY_SCRIPT_BUCKET, d))),
+        MY_SCRIPT_BUCKET.get('__settings__/domains'),
+        MY_SCRIPT_BUCKET.get('__settings__/first_node')
+      ]);
+      let totalSize = 0, totalFiles = 0;
+      const nodeMap = {};
+      for (let i = 0; i < allDomains.length; i++) {
+        const domain = allDomains[i];
+        const info = allInfos[i];
+        const fileCount = Object.keys(info.files).length;
+        if (fileCount > 0) {
+          let domainSize = 0;
+          for (const f of Object.values(info.files)) domainSize += f.size || 0;
+          nodeMap[domain] = { fileCount, totalSize: domainSize };
+          totalSize += domainSize;
+          totalFiles += fileCount;
+        }
+      }
+      const kvDoms = kvVal ? JSON.parse(kvVal) : [];
+      return new Response(JSON.stringify({
+        files,
+        stats: {
+          nodes: Object.entries(nodeMap).map(([d, data]) => ({ domain: d, ...data })),
+          total: totalFiles, totalSize,
+          bucketCount: Object.keys(nodeMap).length, totalDomains: allDomains.length
+        },
+        domains: allDomains,
+        kvDomains: kvDoms,
+        bootstrapped: !!kvVal,
+        firstNode: !!firstNodeVal
+      }), {
+        headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+      });
+    }
 
-        // GET /auth/check — 检查认证状态 
-        if (request.method === 'GET' && path === 'auth/check') { 
-            return new Response(JSON.stringify({ authenticated: isAdmin || !!tokenInfo, isAdmin }), { headers: { 'Content-Type': 'application/json' } }); 
-        } 
+    // 全量同步：按时间戳拉取所有节点的信息文件
+    if (request.method === 'GET' && path === 'sync-all') {
+      let updated = 0, skipped = 0, failed = 0;
+      const results = await Promise.allSettled(
+        allDomains.filter(d => d !== currentDomain).map(async (domain) => {
+          try {
+            const resp = await fetch(`https://${domain}/__info__`, {
+              headers: { 'Authorization': requestAuthHeader }
+            });
+            if (!resp.ok) { failed++; return; }
+            const remoteInfo = await resp.json();
+            const localInfo = await loadInfo(MY_SCRIPT_BUCKET, domain);
+            if (remoteInfo.updated_at > localInfo.updated_at) {
+              await MY_SCRIPT_BUCKET.put(getInfoKey(domain), JSON.stringify(remoteInfo));
+              updated++;
+            } else {
+              skipped++;
+            }
+          } catch (e) { failed++; }
+        })
+      );
+      return new Response(JSON.stringify({ updated, skipped, failed, total: allDomains.length }), {
+        headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+      });
+    }
 
-        // PUT /auth/credentials — 修改管理员密码（首次设置无需认证）
-        if (request.method === 'PUT' && path === 'auth/credentials') {
-            const body = JSON.parse(await request.text() || '{}');
-            if (!body.username || !body.password) return new Response('需要用户名和密码。\n', { status: 400 });
-            const creds = { username: body.username, password: body.password };
-            await MY_SCRIPT_BUCKET.put('__settings__/credentials', JSON.stringify(creds));
-            const syncHeader = isAdmin ? requestAuthHeader : getAuthHeader(body.username, body.password);
-            await syncSettingsToAll('credentials', creds, allDomains, currentDomain, syncHeader);
-            return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-        } 
+    // 保留向后兼容：list-meta 从信息文件读取
+    if (request.method === 'GET' && path === 'list-meta') {
+      if (!isAdmin && tokenInfo && !tokenInfo.permissions.download) return new Response('无下载权限。\n', { status: 403 });
+      const files = await getAllFilesFromInfo(MY_SCRIPT_BUCKET, allDomains);
+      return new Response(JSON.stringify({ files }), {
+        headers: { 'Content-Type': 'application/json;charset=UTF-8' }
+      });
+    }
 
-        // GET /domains — 域名列表 
-        if (request.method === 'GET' && path === 'domains') { 
-            const kvVal = await MY_SCRIPT_BUCKET.get('__settings__/domains'); 
-            const kvDoms = kvVal ? JSON.parse(kvVal) : []; 
-            return new Response(JSON.stringify({ domains: allDomains, kvDomains: kvDoms, bootstrapped: !!kvVal }), { headers: { 'Content-Type': 'application/json' } }); 
-        } 
+    // --- 首次设置端点（无需认证）---
+    // GET /auth/status — 检查是否已设置管理员账号
+    if (request.method === 'GET' && path === 'auth/status') {
+      const configured = !!(await loadKVCredentials(MY_SCRIPT_BUCKET));
+      return new Response(JSON.stringify({ configured }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-        // POST /domains — 添加域名（仅首次） 
-        if (request.method === 'POST' && path === 'domains') { 
-            const existing = await MY_SCRIPT_BUCKET.get('__settings__/domains'); 
-            if (existing) return new Response('域名列表已锁定，不可手动添加。\n', { status: 400 }); 
-            const body = JSON.parse(await request.text() || '{}'); 
-            const newDomain = body.domain || currentDomain; 
-            const newDoms = [newDomain]; 
-            await MY_SCRIPT_BUCKET.put('__settings__/domains', JSON.stringify(newDoms)); 
-            const updatedDoms = await getAllDomains(env, currentDomain, MY_SCRIPT_BUCKET); 
-            await syncSettingsToAll('domains', newDoms, updatedDoms, currentDomain, requestAuthHeader); 
-            return new Response(JSON.stringify({ success: true, domains: updatedDoms }), { headers: { 'Content-Type': 'application/json' } }); 
-        } 
+    // POST /auth/setup — 首次设置管理员账号密码（仅一次）
+    if (request.method === 'POST' && path === 'auth/setup') {
+      const existing = await loadKVCredentials(MY_SCRIPT_BUCKET);
+      if (existing) return new Response('管理员账号已设置，不可重复初始化。\n', { status: 400 });
+      const body = JSON.parse(await request.text() || '{}');
+      if (!body.username || !body.password) return new Response('需要用户名和密码。\n', { status: 400 });
+      const creds = { username: body.username, password: body.password };
+      await MY_SCRIPT_BUCKET.put('__settings__/credentials', JSON.stringify(creds));
+      return new Response(JSON.stringify({ success: true }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-        // DELETE /domains/<domain> — 删除域名（仅下次自动清理，不可手动） 
-        if (request.method === 'DELETE' && path.startsWith('domains/')) { 
-            return new Response('域名不可手动删除。\n', { status: 400 }); 
-        } 
+    // --- 设置管理端点（仅管理员 Basic Auth）---
+    if (hasCredentials && !isAdmin && (path.startsWith('auth/') || path.startsWith('domains') || path.startsWith('tokens') || path.startsWith('sync/'))) {
+      return new Response('未授权访问。\n', { status: 401 });
+    }
 
-        // GET /tokens — 令牌列表 
-        if (request.method === 'GET' && path === 'tokens') { 
-            const val = await MY_SCRIPT_BUCKET.get('__tokens__/list'); 
-            const list = val ? JSON.parse(val) : []; 
-            return new Response(JSON.stringify(list.map((t, i) => ({ ...t, index: i, token: t.token.slice(0, 4) + '***' + t.token.slice(-4) }))), { headers: { 'Content-Type': 'application/json' } }); 
-        } 
+    // GET /auth/check — 检查认证状态
+    if (request.method === 'GET' && path === 'auth/check') {
+      return new Response(JSON.stringify({ authenticated: isAdmin || !!tokenInfo, isAdmin }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-        // POST /tokens — 创建令牌 
-        if (request.method === 'POST' && path === 'tokens') { 
-            const body = JSON.parse(await request.text() || '{}'); 
-            const permissions = body.permissions || { download: false, upload: false, delete: false }; 
-            const newToken = { token: generateToken(), name: body.name || '', permissions, created_at: new Date().toISOString() }; 
-            const val = await MY_SCRIPT_BUCKET.get('__tokens__/list'); 
-            const list = val ? JSON.parse(val) : []; 
-            list.push(newToken); 
-            await MY_SCRIPT_BUCKET.put('__tokens__/list', JSON.stringify(list)); 
-            await syncSettingsToAll('tokens', list, allDomains, currentDomain, requestAuthHeader); 
-            return new Response(JSON.stringify({ success: true, token: newToken }), { headers: { 'Content-Type': 'application/json' } }); 
-        } 
+    // PUT /auth/credentials — 修改管理员密码
+    if (request.method === 'PUT' && path === 'auth/credentials') {
+      const body = JSON.parse(await request.text() || '{}');
+      if (!body.username || !body.password) return new Response('需要用户名和密码。\n', { status: 400 });
+      const creds = { username: body.username, password: body.password };
+      await MY_SCRIPT_BUCKET.put('__settings__/credentials', JSON.stringify(creds));
+      await syncSettingsToAll('credentials', creds, allDomains, currentDomain, requestAuthHeader);
+      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
 
-        // PUT /tokens/<index> — 修改令牌 
-        if (request.method === 'PUT' && path.startsWith('tokens/')) { 
-            const idx = parseInt(path.substring('tokens/'.length)); 
-            const body = JSON.parse(await request.text() || '{}'); 
-            const val = await MY_SCRIPT_BUCKET.get('__tokens__/list'); 
-            const list = val ? JSON.parse(val) : []; 
-            if (idx < 0 || idx >= list.length) return new Response('令牌不存在。\n', { status: 404 }); 
-            if (body.name !== undefined) list[idx].name = body.name; 
-            if (body.permissions) list[idx].permissions = body.permissions; 
-            await MY_SCRIPT_BUCKET.put('__tokens__/list', JSON.stringify(list)); 
-            await syncSettingsToAll('tokens', list, allDomains, currentDomain, requestAuthHeader); 
-            return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } }); 
-        } 
+    // GET /domains — 域名列表
+    if (request.method === 'GET' && path === 'domains') {
+      const kvVal = await MY_SCRIPT_BUCKET.get('__settings__/domains');
+      const kvDoms = kvVal ? JSON.parse(kvVal) : [];
+      return new Response(JSON.stringify({ domains: allDomains, kvDomains: kvDoms, bootstrapped: !!kvVal }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-        // DELETE /tokens/<index> — 删除令牌 
-        if (request.method === 'DELETE' && path.startsWith('tokens/')) { 
-            const idx = parseInt(path.substring('tokens/'.length)); 
-            const val = await MY_SCRIPT_BUCKET.get('__tokens__/list'); 
-            const list = val ? JSON.parse(val) : []; 
-            if (idx < 0 || idx >= list.length) return new Response('令牌不存在。\n', { status: 404 }); 
-            list.splice(idx, 1); 
-            await MY_SCRIPT_BUCKET.put('__tokens__/list', JSON.stringify(list)); 
-            await syncSettingsToAll('tokens', list, allDomains, currentDomain, requestAuthHeader); 
-            return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } }); 
-        } 
+    // POST /domains — 添加域名（仅首次）
+    if (request.method === 'POST' && path === 'domains') {
+      const existing = await MY_SCRIPT_BUCKET.get('__settings__/domains');
+      if (existing) return new Response('域名列表已锁定，不可手动添加。\n', { status: 400 });
+      const body = JSON.parse(await request.text() || '{}');
+      const newDomain = body.domain || currentDomain;
+      const newDoms = [newDomain];
+      await MY_SCRIPT_BUCKET.put('__settings__/domains', JSON.stringify(newDoms));
+      // 如果域名和当前节点一致（首个节点），写入标记
+      if (newDomain === currentDomain) {
+        await MY_SCRIPT_BUCKET.put('__settings__/first_node', '1');
+      }
+      const updatedDoms = await getAllDomains(env, currentDomain, MY_SCRIPT_BUCKET);
+      await syncSettingsToAll('domains', newDoms, updatedDoms, currentDomain, requestAuthHeader);
+      return new Response(JSON.stringify({ success: true, domains: updatedDoms }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-        // POST /sync/pull-from — 从已有域名拉取全量数据 
-        if (request.method === 'POST' && path === 'sync/pull-from') { 
-            const body = JSON.parse(await request.text() || '{}'); 
-            if (!body.domain) return new Response('需要域名。\n', { status: 400 }); 
-            try { 
-                const resp = await fetch(`https://${body.domain}/__settings__/all`, { headers: { 'Authorization': requestAuthHeader } }); 
-                if (!resp.ok) return new Response('同步失败：目标节点拒绝访问。\n', { status: 502 }); 
-                const data = await resp.json(); 
-                if (data.credentials) await MY_SCRIPT_BUCKET.put('__settings__/credentials', JSON.stringify(data.credentials)); 
-                if (data.tokens) await MY_SCRIPT_BUCKET.put('__tokens__/list', JSON.stringify(data.tokens)); 
-                if (data.domains) { 
-                    const existing = await MY_SCRIPT_BUCKET.get('__settings__/domains'); 
-                    const merged = [...new Set([...(existing ? JSON.parse(existing) : []), ...data.domains])]; 
-                    await MY_SCRIPT_BUCKET.put('__settings__/domains', JSON.stringify(merged)); 
-                } 
-                if (data.info) { 
-                    for (const [key, val] of Object.entries(data.info)) { 
-                        await MY_SCRIPT_BUCKET.put(key, val); 
-                    } 
-                } 
-                const newDomains = await getAllDomains(env, currentDomain, MY_SCRIPT_BUCKET); 
-                await Promise.allSettled( 
-                    newDomains.filter(d => d !== currentDomain).map(d => fetch(`https://${d}/__settings__/domains`, { 
-                        method: 'PUT', 
-                        body: JSON.stringify([currentDomain]), 
-                        headers: { 'Authorization': requestAuthHeader, 'Content-Type': 'application/json' } 
-                    }).catch(() => {})) 
-                ); 
-                return new Response(JSON.stringify({ success: true, domains: newDomains }), { headers: { 'Content-Type': 'application/json' } }); 
-            } catch (e) { 
-                return new Response(`同步失败: ${e.message}\n`, { status: 502 }); 
-            } 
-        } 
+    // DELETE /domains/<domain> — 删除域名（仅下次自动清理，不可手动）
+    if (request.method === 'DELETE' && path.startsWith('domains/')) {
+      return new Response('域名不可手动删除。\n', { status: 400 });
+    }
 
-        // GET /__settings__/all — 导出全量设置（用于同步） 
-        if (request.method === 'GET' && path === '__settings__/all') { 
-            const infoKeys = await MY_SCRIPT_BUCKET.list({ prefix: '__info__/' }); 
-            const info = {}; 
-            for (const key of infoKeys.keys) { 
-                const val = await MY_SCRIPT_BUCKET.get(key.name); 
-                if (val) info[key.name] = val; 
-            } 
-            const credentials = await loadKVCredentials(MY_SCRIPT_BUCKET); 
-            const tokensVal = await MY_SCRIPT_BUCKET.get('__tokens__/list'); 
-            const domainsVal = await MY_SCRIPT_BUCKET.get('__settings__/domains'); 
-            return new Response(JSON.stringify({ credentials, tokens: tokensVal ? JSON.parse(tokensVal) : [], domains: domainsVal ? JSON.parse(domainsVal) : [], info }), { headers: { 'Content-Type': 'application/json' } }); 
-        } 
+    // GET /tokens — 令牌列表
+    if (request.method === 'GET' && path === 'tokens') {
+      const val = await MY_SCRIPT_BUCKET.get('__tokens__/list');
+      const list = val ? JSON.parse(val) : [];
+      return new Response(JSON.stringify(list.map((t, i) => ({ ...t, index: i, token: t.token.slice(0, 4) + '***' + t.token.slice(-4), token_full: t.token }))), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-        // PUT /__settings__/<type> — 接收同步（内部使用） 
-        if (request.method === 'PUT' && path.startsWith('__settings__/')) { 
-            const key = path.substring('__settings__/'.length); 
-            const body = await request.text(); 
-            if (['credentials', 'tokens', 'domains'].includes(key)) { 
-                if (key === 'domains') { 
-                    const existing = await MY_SCRIPT_BUCKET.get('__settings__/domains'); 
-                    const newDoms = JSON.parse(body); 
-                    const merged = [...new Set([...(existing ? JSON.parse(existing) : []), ...newDoms])]; 
-                    await MY_SCRIPT_BUCKET.put('__settings__/domains', JSON.stringify(merged)); 
-                } else if (key === 'tokens') { 
-                    const existing = await MY_SCRIPT_BUCKET.get('__tokens__/list'); 
-                    const remote = JSON.parse(body); 
-                    const local = existing ? JSON.parse(existing) : []; 
-                    for (const rt of remote) { 
-                        const found = local.findIndex(l => l.token === rt.token); 
-                        if (found >= 0) local[found] = rt; 
-                        else local.push(rt); 
-                    } 
-                    await MY_SCRIPT_BUCKET.put('__tokens__/list', JSON.stringify(local)); 
-                } else { 
-                    await MY_SCRIPT_BUCKET.put(`__settings__/${key}`, body); 
-                } 
-            } 
-            return new Response('ok\n', { status: 200 }); 
-        } 
+    // POST /tokens — 创建令牌
+    if (request.method === 'POST' && path === 'tokens') {
+      const body = JSON.parse(await request.text() || '{}');
+      const permissions = body.permissions || { download: false, upload: false, delete: false };
+      const newToken = {
+        token: generateToken(),
+        name: body.name || '',
+        permissions,
+        created_at: new Date().toISOString()
+      };
+      const val = await MY_SCRIPT_BUCKET.get('__tokens__/list');
+      const list = val ? JSON.parse(val) : [];
+      list.push(newToken);
+      await MY_SCRIPT_BUCKET.put('__tokens__/list', JSON.stringify(list));
+      await syncSettingsToAll('tokens', list, allDomains, currentDomain, requestAuthHeader);
+      return new Response(JSON.stringify({ success: true, token: newToken }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
 
-        // --- 登录页面 --- 
-        if (path === '') { 
-            return new Response(LP, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } }); 
-        } 
+    // PUT /tokens/<index> — 修改令牌
+    if (request.method === 'PUT' && path.startsWith('tokens/')) {
+      const idx = parseInt(path.substring('tokens/'.length));
+      const body = JSON.parse(await request.text() || '{}');
+      const val = await MY_SCRIPT_BUCKET.get('__tokens__/list');
+      const list = val ? JSON.parse(val) : [];
+      if (idx < 0 || idx >= list.length) return new Response('令牌不存在。\n', { status: 404 });
+      if (body.name !== undefined) list[idx].name = body.name;
+      if (body.permissions) list[idx].permissions = body.permissions;
+      await MY_SCRIPT_BUCKET.put('__tokens__/list', JSON.stringify(list));
+      await syncSettingsToAll('tokens', list, allDomains, currentDomain, requestAuthHeader);
+      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
 
-        // --- 文件下载（从信息文件找所在节点）--- 
-        const nodeParam = url.searchParams.get('node'); 
-        const decodedPath = decodeURIComponent(path); 
-        if (!isAdmin && tokenInfo && !tokenInfo.permissions.download) { 
-            // Allow access to settings page HTML and auth check without download permission 
-            if (decodedPath !== 'auth/check') return new Response('无下载权限。\n', { status: 403 }); 
-        } 
+    // DELETE /tokens/<index> — 删除令牌
+    if (request.method === 'DELETE' && path.startsWith('tokens/')) {
+      const idx = parseInt(path.substring('tokens/'.length));
+      const val = await MY_SCRIPT_BUCKET.get('__tokens__/list');
+      const list = val ? JSON.parse(val) : [];
+      if (idx < 0 || idx >= list.length) return new Response('令牌不存在。\n', { status: 404 });
+      list.splice(idx, 1);
+      await MY_SCRIPT_BUCKET.put('__tokens__/list', JSON.stringify(list));
+      await syncSettingsToAll('tokens', list, allDomains, currentDomain, requestAuthHeader);
+      return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+    }
 
-        if (nodeParam) { 
-            const targetDomain = allDomains.includes(nodeParam) ? nodeParam : null; 
-            if (targetDomain && targetDomain !== currentDomain) { 
-                return proxyGet(targetDomain, decodedPath, requestAuthHeader, url); 
-            } 
-        } else { 
-            const fileNode = await findFileNodeFromInfo(MY_SCRIPT_BUCKET, decodedPath, allDomains, currentDomain); 
-            if (fileNode !== currentDomain) { 
-                return proxyGet(fileNode, decodedPath, requestAuthHeader, url); 
-            } 
-        } 
+    // POST /sync/pull-from — 从已有域名拉取全量数据
+    if (request.method === 'POST' && path === 'sync/pull-from') {
+      const body = JSON.parse(await request.text() || '{}');
+      if (!body.domain) return new Response('需要域名。\n', { status: 400 });
+      try {
+        const resp = await fetch(`https://${body.domain}/__settings__/all`, {
+          headers: { 'Authorization': requestAuthHeader }
+        });
+        if (!resp.ok) return new Response('同步失败：目标节点拒绝访问。\n', { status: 502 });
+        const data = await resp.json();
+        if (data.credentials) await MY_SCRIPT_BUCKET.put('__settings__/credentials', JSON.stringify(data.credentials));
+        if (data.tokens) await MY_SCRIPT_BUCKET.put('__tokens__/list', JSON.stringify(data.tokens));
+        if (data.domains) {
+          const existing = await MY_SCRIPT_BUCKET.get('__settings__/domains');
+          const merged = [...new Set([...(existing ? JSON.parse(existing) : []), ...data.domains])];
+          await MY_SCRIPT_BUCKET.put('__settings__/domains', JSON.stringify(merged));
+        }
+        if (data.info) {
+          for (const [key, val] of Object.entries(data.info)) {
+            await MY_SCRIPT_BUCKET.put(key, val);
+          }
+        }
+        const newDomains = await getAllDomains(env, currentDomain, MY_SCRIPT_BUCKET);
+        // 同步成功后清除首个节点标记
+        await MY_SCRIPT_BUCKET.delete('__settings__/first_node');
+        await Promise.allSettled(
+          newDomains.filter(d => d !== currentDomain).map(d =>
+            fetch(`https://${d}/__settings__/domains`, {
+              method: 'PUT',
+              body: JSON.stringify([currentDomain]),
+              headers: { 'Authorization': requestAuthHeader, 'Content-Type': 'application/json' }
+            }).catch(() => {})
+          )
+        );
+        return new Response(JSON.stringify({ success: true, domains: newDomains }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (e) {
+        return new Response(`同步失败: ${e.message}\n`, { status: 502 });
+      }
+    }
 
-        const file = await MY_SCRIPT_BUCKET.get(decodedPath, { type: 'stream' }); 
-        if (file === null) { 
-            return new Response(`未找到文件: ${decodedPath}\n`, { status: 404 }); 
-        } 
-        return new Response(file, { headers: { 'Content-Type': guessContentType(decodedPath), 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(decodedPath.split('/').pop())}` } }); 
-    }, 
+    // GET /__settings__/all — 导出全量设置（用于同步）
+    if (request.method === 'GET' && path === '__settings__/all') {
+      const infoKeys = await MY_SCRIPT_BUCKET.list({ prefix: '__info__/' });
+      const info = {};
+      for (const key of infoKeys.keys) {
+        const val = await MY_SCRIPT_BUCKET.get(key.name);
+        if (val) info[key.name] = val;
+      }
+      const credentials = await loadKVCredentials(MY_SCRIPT_BUCKET);
+      const tokensVal = await MY_SCRIPT_BUCKET.get('__tokens__/list');
+      const domainsVal = await MY_SCRIPT_BUCKET.get('__settings__/domains');
+      return new Response(JSON.stringify({
+        credentials,
+        tokens: tokensVal ? JSON.parse(tokensVal) : [],
+        domains: domainsVal ? JSON.parse(domainsVal) : [],
+        info
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }
 
-    // 定时任务：同步各节点信息文件 
-    async scheduled(event, env, ctx) { 
-        const { MY_SCRIPT_BUCKET } = env; 
-        if (!MY_SCRIPT_BUCKET) return; 
-        const kvCreds = await loadKVCredentials(MY_SCRIPT_BUCKET); 
-        const username = (kvCreds && kvCreds.username) || env.JIANGUO_USERNAME; 
-        const password = (kvCreds && kvCreds.password) || env.JIANGUO_PASSWORD; 
-        if (!username || !password) return; 
-        const requestAuthHeader = getAuthHeader(username, password); 
-        const allDomains = await getAllDomains(env, 'localhost', MY_SCRIPT_BUCKET); 
-        await Promise.allSettled( 
-            allDomains.filter(d => d !== 'localhost').map(async (domain) => { 
-                try { 
-                    const resp = await fetch(`https://${domain}/__info__`, { headers: { 'Authorization': requestAuthHeader } }); 
-                    if (!resp.ok) return; 
-                    const remoteInfo = await resp.json(); 
-                    const localInfo = await loadInfo(MY_SCRIPT_BUCKET, domain); 
-                    if (remoteInfo.updated_at > localInfo.updated_at) { 
-                        await MY_SCRIPT_BUCKET.put(getInfoKey(domain), JSON.stringify(remoteInfo)); 
-                    } 
-                } catch (e) {} 
-            }) 
-        ); 
-    } 
+    // PUT /__settings__/<type> — 接收同步（内部使用）
+    if (request.method === 'PUT' && path.startsWith('__settings__/')) {
+      const key = path.substring('__settings__/'.length);
+      const body = await request.text();
+      if (['credentials', 'tokens', 'domains'].includes(key)) {
+        if (key === 'domains') {
+          const existing = await MY_SCRIPT_BUCKET.get('__settings__/domains');
+          const newDoms = JSON.parse(body);
+          const merged = [...new Set([...(existing ? JSON.parse(existing) : []), ...newDoms])];
+          await MY_SCRIPT_BUCKET.put('__settings__/domains', JSON.stringify(merged));
+          // 收到外部域名同步时，清除首个节点标记
+          if (merged.some(d => d !== url.hostname)) {
+            await MY_SCRIPT_BUCKET.delete('__settings__/first_node');
+          }
+        } else if (key === 'tokens') {
+          await MY_SCRIPT_BUCKET.put('__tokens__/list', body);
+        } else {
+          await MY_SCRIPT_BUCKET.put(`__settings__/${key}`, body);
+        }
+      }
+      return new Response('ok\n', { status: 200 });
+    }
+
+    // --- UI 页面 ---
+    if (path === '') {
+      return new Response(fileManagerHtml, {
+        headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'public, max-age=600' }
+      });
+    }
+
+    // --- 文件下载（从信息文件找所在节点）---
+    const nodeParam = url.searchParams.get('node');
+    const decodedPath = decodeURIComponent(path);
+    if (!isAdmin && tokenInfo && !tokenInfo.permissions.download) {
+      // Allow access to settings page HTML and auth check without download permission
+      if (decodedPath !== 'auth/check') return new Response('无下载权限。\n', { status: 403 });
+    }
+    if (nodeParam) {
+      const targetDomain = allDomains.includes(nodeParam) ? nodeParam : null;
+      if (targetDomain && targetDomain !== currentDomain) {
+        return proxyGet(targetDomain, decodedPath, requestAuthHeader, url);
+      }
+    } else {
+      const fileNode = await findFileNodeFromInfo(MY_SCRIPT_BUCKET, decodedPath, allDomains, currentDomain);
+      if (fileNode !== currentDomain) {
+        return proxyGet(fileNode, decodedPath, requestAuthHeader, url);
+      }
+    }
+
+    const file = await MY_SCRIPT_BUCKET.get(decodedPath, { type: 'stream' });
+    if (file === null) {
+      return new Response(`未找到文件: ${decodedPath}\n`, { status: 404 });
+    }
+    return new Response(file, {
+      headers: {
+        'Content-Type': guessContentType(decodedPath),
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(decodedPath.split('/').pop())}`
+      }
+    });
+  },
+
+  // 定时任务：同步各节点信息文件
+  async scheduled(event, env, ctx) {
+    const { MY_SCRIPT_BUCKET } = env;
+    if (!MY_SCRIPT_BUCKET) return;
+    const kvCreds = await loadKVCredentials(MY_SCRIPT_BUCKET);
+    const username = (kvCreds && kvCreds.username) || env.JIANGUO_USERNAME;
+    const password = (kvCreds && kvCreds.password) || env.JIANGUO_PASSWORD;
+    if (!username || !password) return;
+    const requestAuthHeader = getAuthHeader(username, password);
+    const allDomains = await getAllDomains(env, 'localhost', MY_SCRIPT_BUCKET);
+    
+    await Promise.allSettled(
+      allDomains.filter(d => d !== 'localhost').map(async (domain) => {
+        try {
+          const resp = await fetch(`https://${domain}/__info__`, {
+            headers: { 'Authorization': requestAuthHeader }
+          });
+          if (!resp.ok) return;
+          const remoteInfo = await resp.json();
+          const localInfo = await loadInfo(MY_SCRIPT_BUCKET, domain);
+          if (remoteInfo.updated_at > localInfo.updated_at) {
+            await MY_SCRIPT_BUCKET.put(getInfoKey(domain), JSON.stringify(remoteInfo));
+          }
+        } catch (e) {}
+      })
+    );
+  }
 };
